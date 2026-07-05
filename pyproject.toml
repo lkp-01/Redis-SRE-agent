@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redis-sre-agent"
+version = "0.1.0"
+description = "Redis SRE Agent 诊断切片的第一阶段项目骨架"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+redis-sre-agent = "redis_sre_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["redis_sre_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["-q"]
