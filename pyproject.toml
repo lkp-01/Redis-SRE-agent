@@ -4,12 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redis-sre-agent"
-version = "0.1.0"
-description = "Redis SRE Agent 诊断切片的第一阶段项目骨架"
+version = "0.2.0"
+description = "Redis SRE Agent 诊断切片的阶段二资源层"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=45.0.0,<46",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "PyYAML>=6.0.0",
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "redis>=5.0.0",
 ]
 
 [project.scripts]
@@ -25,3 +32,4 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-q"]
+asyncio_mode = "auto"
