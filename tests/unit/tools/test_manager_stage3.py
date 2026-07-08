@@ -6,14 +6,25 @@ import pytest
 from pydantic import SecretStr
 
 from redis_sre_agent.core.instances import RedisInstance
+from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
+
+
+class FakeInfoClient:
+    """只覆盖 INFO 的 fake client，避免链路测试访问真实 Redis。"""
+
+    async def info(self, section=None):
+        return {"redis_version": "stage4-fake", "role": "master", "section": section or "all"}
+
+    async def aclose(self):
+        return None
 
 
 def make_instance() -> RedisInstance:
     return RedisInstance(
         id="inst-local-cache",
         name="Local Cache",
-        connection_url=SecretStr("FAKE_TEST_REDIS_CONNECTION_REF"),
+        connection_url=SecretStr("redis://localhost:6379/0"),
         environment="test",
         usage="cache",
         description="Local test cache",
@@ -21,7 +32,14 @@ def make_instance() -> RedisInstance:
 
 
 @pytest.mark.asyncio
-async def test_tool_manager_loads_target_discovery_and_dummy_redis_tool() -> None:
+async def test_tool_manager_loads_target_discovery_and_redis_info_tool(monkeypatch) -> None:
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeInfoClient()
+        return self._client
+
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+
     async with ToolManager(redis_instance=make_instance()) as manager:
         tools = manager.get_tools()
         names = [tool.name for tool in tools]
@@ -34,7 +52,5 @@ async def test_tool_manager_loads_target_discovery_and_dummy_redis_tool() -> Non
         result = await manager.resolve_tool_call(info_tool, {})
 
     assert result["status"] == "success"
-    assert result["tool"] == "info"
-    assert result["mode"] == "mock"
-    assert result["target_handle"] == "inst-local-cache"
-    assert result["target_name"] == "Local Cache"
+    assert result["section"] == "all"
+    assert result["data"]["redis_version"] == "stage4-fake"

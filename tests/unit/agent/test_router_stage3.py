@@ -15,8 +15,19 @@ from redis_sre_agent.targets import redis_binding
 from redis_sre_agent.targets import services as target_services
 from redis_sre_agent.targets.contracts import TargetHandleRecord
 from redis_sre_agent.targets.registry import reset_target_integration_registry
+from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools import manager as tool_manager_module
 from redis_sre_agent.tools.manager import ToolManager
+
+
+class FakeInfoClient:
+    """只提供 INFO，保证曳光弹测试不连接真实 Redis。"""
+
+    async def info(self, section=None):
+        return {"redis_version": "stage4-fake", "role": "master", "section": section or "all"}
+
+    async def aclose(self):
+        return None
 
 
 class FakeTargetHandleStore:
@@ -44,7 +55,7 @@ def make_instance() -> RedisInstance:
     return RedisInstance(
         id="inst-prod-checkout-cache",
         name="Prod Checkout Cache",
-        connection_url=SecretStr("FAKE_TEST_REDIS_CONNECTION_REF"),
+        connection_url=SecretStr("redis://localhost:6379/0"),
         environment="production",
         usage="cache",
         description="Checkout service cache",
@@ -66,6 +77,11 @@ async def test_router_toolmanager_chain_resolves_target_and_calls_info(monkeypat
     instance = make_instance()
     fake_store = FakeTargetHandleStore()
 
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeInfoClient()
+        return self._client
+
     async def fake_get_instances():
         return [instance]
 
@@ -80,6 +96,7 @@ async def test_router_toolmanager_chain_resolves_target_and_calls_info(monkeypat
     monkeypatch.setattr(target_services, "get_target_handle_store", lambda: fake_store)
     monkeypatch.setattr(tool_manager_module, "get_target_handle_store", lambda: fake_store)
     monkeypatch.setattr(redis_binding, "get_instance_by_id", fake_get_instance_by_id)
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
 
     route = await route_to_appropriate_agent(instance.name)
     async with ToolManager() as manager:
@@ -101,7 +118,6 @@ async def test_router_toolmanager_chain_resolves_target_and_calls_info(monkeypat
     assert route is AgentType.REDIS_CHAT
     assert target_result["status"] == "resolved"
     assert info_result["status"] == "success"
-    assert info_result["tool"] == "info"
-    assert info_result["target_handle"].startswith("tgt_")
+    assert info_result["data"]["redis_version"] == "stage4-fake"
     assert fake_store.records
-    assert "FAKE_TEST_REDIS_CONNECTION_REF" not in payload
+    assert "redis://localhost:6379/0" not in payload
