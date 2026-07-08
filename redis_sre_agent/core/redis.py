@@ -80,6 +80,24 @@ SRE_CLUSTERS_SCHEMA = {
     ],
 }
 
+SRE_TARGETS_SCHEMA = {
+    "index": {
+        "name": SRE_TARGETS_INDEX,
+        "prefix": f"{SRE_TARGETS_INDEX}:",
+        "storage_type": "hash",
+    },
+    "fields": [
+        {"name": "target_kind", "type": "tag"},
+        {"name": "display_name", "type": "tag"},
+        {"name": "name", "type": "tag"},
+        {"name": "environment", "type": "tag"},
+        {"name": "target_type", "type": "tag"},
+        {"name": "search_text", "type": "text"},
+        {"name": "user_id", "type": "tag"},
+        {"name": "updated_at", "type": "numeric"},
+    ],
+}
+
 
 class LightweightSearchIndex:
     """阶段二轻量索引对象。
@@ -135,6 +153,14 @@ async def get_clusters_index(config: Optional[Settings] = None) -> LightweightSe
     cfg = config or settings
     client = get_redis_client(url=cfg.redis_url.get_secret_value(), config=cfg)
     return LightweightSearchIndex(SRE_CLUSTERS_SCHEMA, client)
+
+
+# 目标目录索引插槽。阶段三的 core.targets 默认直接从实例/集群资源层构建目录；
+# 这个入口保留给后续需要持久化 target catalog 时复用。
+async def get_targets_index(config: Optional[Settings] = None) -> LightweightSearchIndex:
+    cfg = config or settings
+    client = get_redis_client(url=cfg.redis_url.get_secret_value(), config=cfg)
+    return LightweightSearchIndex(SRE_TARGETS_SCHEMA, client)
 
 #检查 Redis 是否能连通
 async def test_redis_connection(

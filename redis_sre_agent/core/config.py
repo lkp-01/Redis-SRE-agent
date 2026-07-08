@@ -143,7 +143,13 @@ class TargetIntegrationsConfig(BaseModel):
             )
         }
     )
-    client_factories: Dict[str, TargetIntegrationComponentConfig] = Field(default_factory=dict)
+    client_factories: Dict[str, TargetIntegrationComponentConfig] = Field(
+        default_factory=lambda: {
+            "redis.data": TargetIntegrationComponentConfig(
+                class_path="redis_sre_agent.targets.redis_binding.RedisDataClientFactory"
+            )
+        }
+    )
 
 #系统启动所需要的所有参数，并赋予默认值
 class Settings(BaseSettings):
@@ -189,6 +195,12 @@ class Settings(BaseSettings):
     max_iterations: int = Field(default=50, description="后续 Agent 最大循环次数插槽。")
     knowledge_max_iterations: int = Field(default=8, description="后续知识问答循环次数插槽。")
     tool_timeout: int = Field(default=60, description="后续工具超时插槽。")
+    tool_cache_enabled: bool = Field(default=True, description="工具结果缓存开关插槽。")
+    tool_cache_default_ttl: int = Field(default=60, description="工具结果默认缓存秒数。")
+    tool_cache_ttl_overrides: Dict[str, int] = Field(
+        default_factory=dict,
+        description="按工具名片段覆盖缓存 TTL 的插槽。",
+    )
     agent_permission_mode: Literal["read_only", "read_write"] = Field(default="read_only")
 
     prometheus_url: Optional[str] = Field(default=None, description="Prometheus 地址插槽。")
@@ -197,7 +209,12 @@ class Settings(BaseSettings):
     api_key: Optional[SecretStr] = Field(default=None, description="API 认证 key 插槽。")
     allowed_hosts: list[str] = Field(default=["*"], description="允许的 host。")
 
-    tool_providers: List[str] = Field(default_factory=list, description="工具 provider 插槽。")
+    tool_providers: List[str] = Field(
+        default_factory=lambda: [
+            "redis_sre_agent.tools.diagnostics.redis_command.provider.RedisCommandToolProvider"
+        ],
+        description="阶段三默认只加载 dummy Redis command provider，真实诊断工具在阶段四补齐。",
+    )
     mcp_servers: Dict[str, Union[MCPServerConfig, Dict[str, Any]]] = Field(default_factory=dict)
     skill_roots: List[str] = Field(default_factory=list, description="技能目录插槽。")
     skill_backend_kind: Literal["redis", "custom"] = Field(default="redis")

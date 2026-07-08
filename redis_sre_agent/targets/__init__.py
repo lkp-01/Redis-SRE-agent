@@ -1,7 +1,38 @@
-"""诊断目标目录的阶段一占位包。
+"""可插拔 Redis target discovery/binding 运行时。"""
 
-后续会在这里描述或管理被诊断的 Redis 实例、集群或其他目标。
-当前阶段不保存目标信息，也不读取任何连接配置。
-"""
+from .contracts import (
+    BindingRequest,
+    BindingResult,
+    DiscoveryCandidate,
+    DiscoveryRequest,
+    DiscoveryResponse,
+    ProviderLoadRequest,
+    PublicTargetBinding,
+    PublicTargetMatch,
+    TargetBindingStrategy,
+    TargetDiscoveryBackend,
+    TargetHandleRecord,
+)
+from .handle_store import RedisTargetHandleStore, get_target_handle_store
+from .registry import TargetIntegrationRegistry, get_target_integration_registry
+from .services import TargetBindingService, TargetDiscoveryService
 
-__all__: list[str] = []
+__all__ = [
+    "BindingRequest",
+    "BindingResult",
+    "DiscoveryCandidate",
+    "DiscoveryRequest",
+    "DiscoveryResponse",
+    "ProviderLoadRequest",
+    "PublicTargetBinding",
+    "PublicTargetMatch",
+    "RedisTargetHandleStore",
+    "TargetBindingService",
+    "TargetBindingStrategy",
+    "TargetDiscoveryBackend",
+    "TargetDiscoveryService",
+    "TargetHandleRecord",
+    "TargetIntegrationRegistry",
+    "get_target_handle_store",
+    "get_target_integration_registry",
+]

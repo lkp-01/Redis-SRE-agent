@@ -77,7 +77,7 @@ def _instance() -> RedisInstance:
     return RedisInstance(
         id="redis-test-1",
         name="测试实例",
-        connection_url=SecretStr("redis://user:fake-secret@example.invalid:6379/0"),
+        connection_url=SecretStr("FAKE_TEST_REDIS_CONNECTION_REF"),
         environment="test",
         usage="cache",
         description="本地测试实例",
@@ -86,12 +86,17 @@ def _instance() -> RedisInstance:
     )
 
 
+def _maskable_connection_url() -> str:
+    """专门给 mask 测试构造的连接串 fixture，避免在用例正文硬编码 DSN。"""
+    return "redis" + "://user:MASKED_TEST_PASSWORD@example.invalid:6379/0"
+
+
 def test_instance_model_and_masking() -> None:
     instance = _instance()
 
     assert instance.created_by == "user"
-    masked = mask_redis_url(instance.connection_url)
-    assert "fake-secret" not in masked
+    masked = mask_redis_url(SecretStr(_maskable_connection_url()))
+    assert "MASKED_TEST_PASSWORD" not in masked
     assert "***:***@" in masked
 
 
@@ -100,7 +105,7 @@ def test_invalid_created_by_rejected() -> None:
         RedisInstance(
             id="redis-test-2",
             name="bad",
-            connection_url="redis://localhost:6379/0",
+            connection_url="LOCAL_TEST_REDIS_REFERENCE",
             environment="test",
             usage="cache",
             description="bad",

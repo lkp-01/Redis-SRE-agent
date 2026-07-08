@@ -1,7 +1,6 @@
-"""Agent 主链路目录的阶段一占位包。
+"""Agent 层入口。"""
 
-真正的 Agent 推理、工具调用、诊断流程和回答生成都不在第一阶段实现。
-当前只保留目录，方便后续按稳定路径迁移代码。
-"""
+from .models import AgentResponse
+from .router import AgentType, route_to_appropriate_agent
 
-__all__: list[str] = []
+__all__ = ["AgentResponse", "AgentType", "route_to_appropriate_agent"]

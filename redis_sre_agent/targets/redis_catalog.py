@@ -1,0 +1,138 @@
+"""
+去系统的底层目录里翻看所有的 Redis 数据库资源，
+根据你的查询词给它们打分、排名，最后决定是直接把最匹配的交出去，还是因为长得像的太多，要求你进一步确认。
+"""
+
+from __future__ import annotations
+
+from typing import List
+
+from .contracts import (
+    DISCOVERY_STATUS_TOO_MANY_MATCHES,
+    MULTI_TARGET_SELECTION_LIMIT,
+    DiscoveryCandidate,
+    DiscoveryRequest,
+    DiscoveryResponse,
+)
+from .registry import get_target_integration_registry
+
+# 翻出一堆数据后，决定是直接返回数据库资源还是找用户确认
+def _select_catalog_candidates(
+    limited: List[DiscoveryCandidate],
+    exact_ranked: List[DiscoveryCandidate],
+    *,
+    allow_multiple: bool,
+    max_results: int,
+) -> tuple[List[DiscoveryCandidate], bool, bool]:
+    selection_limit = max(1, min(max_results, MULTI_TARGET_SELECTION_LIMIT))
+    if exact_ranked:
+        if allow_multiple:
+            if len(exact_ranked) > selection_limit:
+                return [], False, True
+            return exact_ranked[:selection_limit], False, False
+        top_exact = exact_ranked[0]
+        if len(exact_ranked) > 1 and exact_ranked[1].score >= top_exact.score - 0.75:
+            return exact_ranked[:selection_limit], True, False
+        return [top_exact], False, False
+    return limited[:selection_limit], True, False
+
+
+class RedisCatalogDiscoveryBackend:
+    """从阶段二实例/集群资源层解析安全 target。"""
+
+    backend_name = "redis_catalog"
+
+    async def resolve(self, request: DiscoveryRequest) -> DiscoveryResponse:
+        from redis_sre_agent.core.targets import (
+            _confidence_from_score,
+            _exact_target_terms,
+            _normalize,
+            _parse_query_hints,
+            _query_mentions_exact_target,
+            _score_target_doc,
+            build_public_match_from_doc,
+            get_target_catalog,
+        )
+
+        docs = await get_target_catalog(user_id=request.user_id)
+        if not docs:
+            return DiscoveryResponse(status="no_match")
+
+        registry = get_target_integration_registry()
+        normalized_query = _normalize(request.query)
+        hints = _parse_query_hints(request.query)
+        ranked: List[DiscoveryCandidate] = []
+        exact_ranked: List[DiscoveryCandidate] = []
+        for doc in docs:
+            score, reasons = _score_target_doc(
+                request.query,
+                doc,
+                preferred_capabilities=request.preferred_capabilities,
+                hints=hints,
+            )
+            if score < 2.5:
+                continue
+            public_match = build_public_match_from_doc(
+                doc,
+                confidence=_confidence_from_score(score),
+                match_reasons=reasons,
+                score=score,
+            )
+            candidate = DiscoveryCandidate(
+                public_match=public_match,
+                binding_strategy=registry.default_binding_strategy,
+                binding_subject=doc.resource_id,
+                private_binding_ref={"target_kind": doc.target_kind},
+                discovery_backend=self.backend_name,
+                score=score,
+                confidence=public_match.confidence,
+            )
+            ranked.append(candidate)
+            exact_query_match = normalized_query and normalized_query in _exact_target_terms(doc)
+            if exact_query_match or (
+                request.allow_multiple and _query_mentions_exact_target(doc, hints)
+            ):
+                exact_ranked.append(candidate)
+
+        ranked.sort(key=lambda candidate: (candidate.score, candidate.confidence), reverse=True)
+        exact_ranked.sort(key=lambda candidate: (candidate.score, candidate.confidence), reverse=True)
+        response_limit = max(1, min(request.max_results, 10))
+        limited = ranked[:response_limit]
+        if not limited:
+            return DiscoveryResponse(status="no_match")
+
+        selected, clarification_required, too_many_matches = _select_catalog_candidates(
+            limited,
+            exact_ranked,
+            allow_multiple=request.allow_multiple,
+            max_results=request.max_results,
+        )
+        selection_limit = max(1, min(request.max_results, MULTI_TARGET_SELECTION_LIMIT))
+        response_matches = (
+            exact_ranked[:response_limit] if too_many_matches and exact_ranked else limited
+        )
+        match_count = len(exact_ranked) if exact_ranked else len(ranked)
+        status = (
+            DISCOVERY_STATUS_TOO_MANY_MATCHES
+            if too_many_matches
+            else "clarification_required"
+            if clarification_required
+            else "resolved"
+            if selected
+            else "no_match"
+        )
+        return DiscoveryResponse(
+            status=status,
+            clarification_required=clarification_required or too_many_matches,
+            matches=[candidate.public_match for candidate in response_matches],
+            selected_matches=selected,
+            message=(
+                f"Matched {match_count} Redis targets, but at most {selection_limit} "
+                "can be selected for one multi-target request. Ask the user to narrow the target set."
+                if too_many_matches
+                else None
+            ),
+            max_selectable=selection_limit if too_many_matches else None,
+            match_count=match_count,
+            truncated=len(response_matches) < match_count,
+        )

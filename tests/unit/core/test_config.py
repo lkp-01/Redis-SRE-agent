@@ -27,11 +27,11 @@ def test_settings_can_be_created_without_real_external_secrets() -> None:
 def test_secretstr_does_not_leak_in_repr() -> None:
     settings = Settings(
         _env_file=None,
-        redis_url=SecretStr("redis://user:fake-secret@example.invalid:6379/0"),
+        redis_url=SecretStr("FAKE_TEST_REDIS_CONNECTION_REF"),
     )
 
     rendered = repr(settings)
-    assert "fake-secret" not in rendered
+    assert "FAKE_TEST_REDIS_CONNECTION_REF" not in rendered
     assert "SecretStr" in rendered
 
 
@@ -42,7 +42,7 @@ def test_environment_overrides_defaults() -> None:
         "LOG_LEVEL": "DEBUG",
         "HOST": "127.0.0.1",
         "PORT": "9001",
-        "REDIS_URL": "redis://localhost:6379/2",
+        "REDIS_URL": "LOCAL_TEST_REDIS_REFERENCE",
     }
     with patch.dict(os.environ, env, clear=True):
         settings = Settings(_env_file=None)
@@ -52,7 +52,7 @@ def test_environment_overrides_defaults() -> None:
     assert settings.log_level == "DEBUG"
     assert settings.host == "127.0.0.1"
     assert settings.port == 9001
-    assert settings.redis_url.get_secret_value() == "redis://localhost:6379/2"
+    assert settings.redis_url.get_secret_value() == "LOCAL_TEST_REDIS_REFERENCE"
 
 
 def test_yaml_config_file_loads_and_env_wins(tmp_path: Path) -> None:

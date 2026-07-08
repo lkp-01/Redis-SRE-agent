@@ -32,8 +32,8 @@ def test_get_redis_client_creates_client_without_caching(mock_redis) -> None:
     mock_client = Mock()
     mock_redis.from_url.return_value = mock_client
 
-    assert get_redis_client(url="redis://localhost:6379/0") is mock_client
-    assert get_redis_client(url="redis://localhost:6379/0") is mock_client
+    assert get_redis_client(url="LOCAL_TEST_REDIS_REFERENCE") is mock_client
+    assert get_redis_client(url="LOCAL_TEST_REDIS_REFERENCE") is mock_client
     assert mock_redis.from_url.call_count == 2
 
 
