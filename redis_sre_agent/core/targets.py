@@ -697,8 +697,22 @@ async def build_seed_hint_candidates(
 
 
 async def get_thread_target_state(thread_id: str) -> ThreadTargetState:
-    """读取线程 target 状态的阶段三 no-op 插槽。"""
-    return ThreadTargetState()
+    """从 thread context 读取已绑定 target 状态。"""
+
+    try:
+        from redis_sre_agent.core.threads import ThreadManager
+
+        thread = await ThreadManager().get_thread(thread_id)
+    except Exception:
+        thread = None
+    if thread is None:
+        return ThreadTargetState()
+    return ThreadTargetState(
+        attached_target_handles=get_attached_target_handles_from_context(thread.context),
+        active_target_handle=str(thread.context.get("active_target_handle") or "") or None,
+        target_toolset_generation=int(thread.context.get("target_toolset_generation") or 0),
+        target_bindings=get_target_bindings_from_context(thread.context),
+    )
 
 
 async def attach_target_matches(
@@ -734,15 +748,23 @@ async def materialize_bound_target_scope(
     attached_bindings = list(selected_bindings)
     generation = 1 if selected_bindings else 0
     active_handle = selected_bindings[0].target_handle if selected_bindings else None
+    context_updates = build_bound_target_scope_context(
+        attached_bindings,
+        generation=generation,
+        active_handle=active_handle,
+    )
+    if thread_id:
+        try:
+            from redis_sre_agent.core.threads import ThreadManager
+
+            await ThreadManager().update_thread_context(thread_id, context_updates)
+        except Exception:
+            pass
     return MaterializedTargetScope(
         selected_bindings=list(selected_bindings),
         attached_bindings=attached_bindings,
         target_toolset_generation=generation,
-        context_updates=build_bound_target_scope_context(
-            attached_bindings,
-            generation=generation,
-            active_handle=active_handle,
-        ),
+        context_updates=context_updates,
     )
 
 

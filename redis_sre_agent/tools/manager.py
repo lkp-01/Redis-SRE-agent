@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,24 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_LLM_TOOL_LIMIT = 64
 ToolExecutionDecision = Any
+_REDACTED = "[REDACTED]"
+
+
+def _safe_error_message(exc: Exception) -> str:
+    """清洗工具异常文本，避免 manager 兜底路径泄漏连接串或凭据。"""
+
+    message = str(exc)
+    message = re.sub(
+        r"(?i)\b(rediss?|unix)://[^\s'\"<>@]+@[^\s'\"<>]+",
+        lambda match: re.sub(r"://([^:@/]+):[^@/]+@", r"://\1:[REDACTED]@", match.group(0)),
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(password|secret|token|requirepass|masterauth|pass)(\s*[=:]\s*)([^\s,;}]+)",
+        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
+        message,
+    )
+    return message
 
 
 class ToolManager:
@@ -33,6 +52,7 @@ class ToolManager:
     _provider_class_cache: Dict[str, type] = {}
     _always_on_providers = [
         "redis_sre_agent.tools.target_discovery.provider.TargetDiscoveryToolProvider",
+        "redis_sre_agent.tools.knowledge.knowledge_base.KnowledgeBaseToolProvider",
     ]
 
     def __init__(
@@ -131,7 +151,23 @@ class ToolManager:
             self._stack = None
 
     async def _load_thread_attached_targets(self) -> None:
-        """线程已绑定 target 恢复的阶段三 no-op 插槽。"""
+        """从 Thread context 恢复已绑定 target，并加载对应 provider。"""
+
+        if not self.thread_id:
+            return None
+        try:
+            from redis_sre_agent.core.targets import get_thread_target_state
+
+            state = await get_thread_target_state(self.thread_id)
+        except Exception:
+            logger.exception("Failed to load attached targets for thread %s", self.thread_id)
+            return None
+        if not state.target_bindings:
+            return None
+        await self.attach_bound_targets(
+            state.target_bindings,
+            generation=state.target_toolset_generation or None,
+        )
         return None
 
     async def _load_instance_scoped_providers(
@@ -489,5 +525,5 @@ class ToolManager:
                 results.append(await self.resolve_tool_call(name, args))
             except Exception as exc:
                 logger.exception("Tool call execution failed for %s", tool_call)
-                results.append({"status": "failed", "error": str(exc)})
+                results.append({"status": "failed", "error": _safe_error_message(exc)})
         return results

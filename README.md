@@ -1,63 +1,77 @@
 # Redis SRE Agent 诊断切片
 
-这是一个裁剪复刻项目，目标是逐步做出一个能诊断 Redis 问题的 SRE Agent。当前目录不是原
-项目的完整复制品，而是按阶段把最小可运行能力迁移过来。
+这是 `original-redis-sre-agent-main` 的裁剪复刻项目。当前目标不是复制完整平台，
+而是保留 Redis 诊断主链路的架构形状，让本地 CLI 可以稳定走通：
 
-## 项目边界
-
-- 原项目只读参考目录：`D:\developer\redis_sre_prac\original-redis-sre-agent-main`
-- 当前可写项目目录：`D:\developer\redis_sre_prac\my_sre_agent`
-- 包名保持为 `redis_sre_agent`，这样后续从原项目迁移代码时 import 路径可以尽量少改。
-- 当前仍然没有 ToolManager、Redis 诊断工具、Agent 主链路、LangGraph、后台任务、调度、RAG、MCP 或 evaluation。
-
-## 当前阶段已经具备什么
-
-阶段一完成了 Python 项目骨架：可安装、可导入、可编译、可运行最小测试。
-
-阶段二增加了资源层能力：
-
-- `core/config.py`：读取基础配置，支持环境变量、`.env`、YAML/TOML/JSON 配置文件。
-- `core/encryption.py`：用 `REDIS_SRE_MASTER_KEY` 和 AES-GCM 加密 Redis 密码、连接串等敏感字段。
-- `core/keys.py`：集中构造 Redis key，避免各处手写字符串。
-- `core/redisearch.py`：对 RediSearch TAG 查询里的用户输入做转义。
-- `core/redis.py`：提供 Redis 客户端工厂和实例/集群索引 schema 插槽。
-- `core/instances.py`：提供 Redis 实例模型和保存、查询、删除等资源层函数。
-- `core/clusters.py`：提供 Redis 集群模型和保存、查询、删除等资源层函数。
-
-资源层的第一性原理是：上层业务不应该直接处理存储细节。上层只关心“我要保存一个实例”
-或“我要按 id 读取一个集群”，资源层负责 key 怎么拼、敏感字段怎么加密、索引字段怎么放、
-读取后怎么还原为模型。
-
-## 本地 master key
-
-加密函数需要 `REDIS_SRE_MASTER_KEY`。本地测试可以用下面的方式生成一个临时 key：
-
-```powershell
-python -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())"
+```text
+Click LazyGroup
+-> cli/query.py
+-> Thread
+-> router
+-> ChatAgent 或 SRELangGraphAgent
+-> StateGraph agent/tool loop
+-> ToolManager
+-> target discovery / RedisCommandToolProvider
+-> ResultEnvelope evidence
+-> assistant response
+-> Thread trace
 ```
 
-把命令输出写进本地环境变量即可。不要把真实 key、Redis 密码或带密码的连接串写进文档、
-日志、测试输出或提交记录。
+## 当前阶段
 
-## 当前可运行命令
+Stage 5 已落实“持久任务执行与可验证入口”的裁剪版主链：
 
-请在当前目录执行：
+- `redis-sre-agent query` 由 Click LazyGroup 延迟加载。
+- `cli/query.py` 可以创建或恢复 Thread，保存 user/assistant message，并把工具 evidence 保存为 message trace。
+- router 保留 original 的 `AgentType` 形状；测试和无真实 LLM 环境使用 fallback，不访问 OpenAI API。
+- `ChatAgent` 和 `SRELangGraphAgent` 都使用真实 `langgraph.graph.StateGraph`，包含 agent node、tool node、conditional edge 和工具循环。
+- `ToolManager` 统一加载 always-on target discovery、dummy knowledge slot，以及显式或动态绑定的 Redis command provider。
+- no-instance 查询会先调用 `resolve_redis_targets`，解析成功后绑定 active target，再继续调用 `info`、`memory_stats`、`client_list`、`slowlog` 等只读诊断工具。
+- explicit instance 查询会直接加载 `RedisCommandToolProvider`，不绕过 ToolManager。
+- Redis 工具错误、慢日志命令、CONFIG 敏感项和 manager 兜底错误会做脱敏处理。
+- `core/tasks.py` 保留 original 风格 TaskManager 和顶层 task helper，但当前 CLI 同步执行，不启动 worker。
+
+## 与 original 的差异
+
+当前仍是诊断切片，不包含完整生产平台：
+
+- Thread、Task 和 target handle 以轻量内存/fake 后端支撑测试；完整 Redis 持久化和搜索索引是后续阶段。
+- MCP、RAG ingestion、support package 解压分析、API、worker、scheduler、OpenTelemetry、evaluation suite 和 UI 都只保留插槽或说明。
+- knowledge provider 是 dummy slot，只返回空结果，避免提前实现 RAG。
+- terminal synthesis 的确定性报告只用于 fake LLM fallback/test helper；正式主链仍是 StateGraph + ToolManager 工具循环。
+
+## 运行测试
+
+请在 `D:\developer\redis_sre_prac\my_sre_agent` 执行：
 
 ```powershell
 python -m pip install -e .
 python -m compileall redis_sre_agent tests
 python -m pytest -q
-python -c "from redis_sre_agent.core.encryption import encrypt_secret; print(encrypt_secret.__name__)"
-python -c "from redis_sre_agent.core.instances import RedisInstance; print(RedisInstance.__name__)"
-python -c "from redis_sre_agent.core.clusters import RedisCluster; print(RedisCluster.__name__)"
-python -c "from redis_sre_agent.core.redis import get_redis_client; print(get_redis_client.__name__)"
-redis-sre-agent status
 ```
 
-测试全部使用 mock/fake，不访问真实 Redis、OpenAI API 或外部网络。
+测试全部使用 fake Redis client、fake LLM 或 fake backend，不依赖真实 OpenAI API、真实 Redis 服务或外部网络。
 
-## 后续阶段才会做什么
+## CLI 示例
 
-后续阶段会逐步补 ToolManager、Redis 诊断工具、Agent 主链路、target discovery、target
-binding、调度、RAG、MCP 和 evaluation。当前阶段只完成配置、密钥、Redis 存储和实例/集群
-模型这一层。
+查看命令：
+
+```powershell
+redis-sre-agent --help
+redis-sre-agent query --help
+redis-sre-agent version
+```
+
+运行一次本地诊断链路：
+
+```powershell
+redis-sre-agent query "为什么 Redis 慢"
+```
+
+如果已经有实例资源，也可以显式指定：
+
+```powershell
+redis-sre-agent query "检查 memory 和 slowlog" --instance-id inst-local-cache --agent chat
+```
+
+不要把真实 API key、Redis 密码、token、DSN 或带密码的连接串写进文档、日志、测试输出或提交记录。

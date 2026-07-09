@@ -54,3 +54,22 @@ async def test_tool_manager_loads_target_discovery_and_redis_info_tool(monkeypat
     assert result["status"] == "success"
     assert result["section"] == "all"
     assert result["data"]["redis_version"] == "stage4-fake"
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_execute_tool_calls_redacts_fallback_errors(monkeypatch) -> None:
+    secret = "manager-secret-value"
+    raw_url = f"redis://default:{secret}@cache.internal:6379/0"
+
+    async with ToolManager() as manager:
+        async def fake_resolve_tool_call(tool_name, args):
+            raise RuntimeError(f"failed password={secret} token={secret} url={raw_url}")
+
+        monkeypatch.setattr(manager, "resolve_tool_call", fake_resolve_tool_call)
+        result = await manager.execute_tool_calls([{"name": "fake_tool", "args": {}}])
+
+    payload = str(result)
+    assert result[0]["status"] == "failed"
+    assert secret not in payload
+    assert raw_url not in payload
+    assert "[REDACTED]" in payload
