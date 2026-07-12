@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from pydantic import SecretStr
 from langgraph.graph import StateGraph
 
@@ -21,6 +22,30 @@ from redis_sre_agent.tools.manager import ToolManager
 _PASSWORD = "stage5-chat-password"
 _TOKEN = "stage5-chat-token"
 _URL = f"redis://default:{_PASSWORD}@cache.internal:6379/0"
+
+
+class FinalTextAfterToolLLM:
+    def __init__(self, final_text: str, terminal_text: str = "") -> None:
+        self.final_text = final_text
+        self.terminal_text = terminal_text
+        self.tools: list[Any] = []
+
+    def bind_tools(self, tools: list[Any]) -> "FinalTextAfterToolLLM":
+        self.tools = list(tools)
+        return self
+
+    async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        if messages and isinstance(messages[0], SystemMessage) and "iteration budget" in str(
+            messages[0].content
+        ).lower():
+            return AIMessage(content=self.terminal_text)
+        if any(isinstance(message, ToolMessage) for message in messages):
+            return AIMessage(content=self.final_text)
+        info_tool = next(tool.name for tool in self.tools if tool.name.endswith("info"))
+        return AIMessage(
+            content="",
+            tool_calls=[{"id": "call_final_text", "name": info_tool, "args": {}}],
+        )
 
 
 class FakeChatRedisClient:
@@ -126,7 +151,10 @@ async def test_chat_agent_process_query_collects_redis_evidence(monkeypatch) -> 
         return self._client
 
     monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
-    agent = ChatAgent(redis_instance=make_instance())
+    agent = ChatAgent(
+        redis_instance=make_instance(),
+        llm=FakeToolCallingLLM(agent_kind="chat"),
+    )
 
     response = await agent.process_query(
         "check redis memory and clients",
@@ -145,3 +173,51 @@ async def test_chat_agent_process_query_collects_redis_evidence(monkeypatch) -> 
     assert "Evidence 摘要" in response.response
     assert "下一步建议" in response.response
     _assert_no_sensitive_payload(response.model_dump(mode="json"))
+
+
+@pytest.mark.asyncio
+async def test_chat_returns_llm_final_text_after_tool_loop(monkeypatch) -> None:
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeChatRedisClient()
+        return self._client
+
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    agent = ChatAgent(
+        redis_instance=make_instance(),
+        llm=FinalTextAfterToolLLM("FAKE_LLM_FINAL_ANSWER"),
+    )
+
+    response = await agent.process_query(
+        "check one metric",
+        session_id="session-final-text",
+        user_id=None,
+        context={"thread_id": "thread-final-text"},
+    )
+
+    assert response.response == "FAKE_LLM_FINAL_ANSWER"
+    assert response.tool_envelopes
+    assert "Redis 诊断摘要" not in response.response
+
+
+@pytest.mark.asyncio
+async def test_chat_iteration_limit_uses_llm_terminal_synthesis(monkeypatch) -> None:
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeChatRedisClient()
+        return self._client
+
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    llm = FinalTextAfterToolLLM("unused", terminal_text="FAKE_TERMINAL_SYNTHESIS")
+    agent = ChatAgent(redis_instance=make_instance(), llm=llm)
+
+    response = await agent.process_query(
+        "stop at limit",
+        session_id="session-limit",
+        user_id=None,
+        max_iterations=1,
+        context={"thread_id": "thread-limit"},
+    )
+
+    assert response.response == "FAKE_TERMINAL_SYNTHESIS"
+    assert "Redis 诊断摘要" not in response.response

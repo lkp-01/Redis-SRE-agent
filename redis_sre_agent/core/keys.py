@@ -56,6 +56,12 @@ class RedisKeys:
         return f"sre:thread:{thread_id}:instances"
 
     @staticmethod
+    def message_decision_trace(message_id: str) -> str:
+        """一条 assistant 消息对应的工具决策轨迹。"""
+
+        return f"sre:message:{message_id}:decision_trace"
+
+    @staticmethod
     def task_status(task_id: str) -> str:
         return f"sre:task:{task_id}:status"
 

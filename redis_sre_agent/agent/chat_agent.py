@@ -31,7 +31,11 @@ from .helpers import (
     resolve_graph_thread_id,
 )
 from .models import AgentResponse
-from .terminal_synthesis import build_deterministic_diagnostic_response
+from .terminal_synthesis import (
+    TerminalSynthesisConfig,
+    build_deterministic_diagnostic_response,
+    synthesize_terminal_response,
+)
 from .tool_execution import execute_tool_calls_with_gate
 
 logger = logging.getLogger(__name__)
@@ -65,6 +69,10 @@ class ChatAgentState(TypedDict):
 class ChatAgent:
     """基于 StateGraph 的轻量 Redis 问答 Agent。"""
 
+    ITERATION_LIMIT_SYNTHESIS_MESSAGE_LIMIT = 14
+    ITERATION_LIMIT_SYNTHESIS_CONTEXT_LIMIT = 16000
+    ITERATION_LIMIT_SYNTHESIS_ITEM_LIMIT = 2000
+
     def __init__(
         self,
         redis_instance: Optional[RedisInstance] = None,
@@ -89,6 +97,67 @@ class ChatAgent:
 
                 llm = FakeToolCallingLLM(agent_kind="chat")
         self.llm = llm
+
+    @staticmethod
+    def _reached_iteration_limit(
+        final_state: Dict[str, Any], requested_max_iterations: int
+    ) -> bool:
+        iteration_count = final_state.get("iteration_count")
+        max_iterations = final_state.get("max_iterations", requested_max_iterations)
+        return (
+            isinstance(iteration_count, int)
+            and isinstance(max_iterations, int)
+            and iteration_count >= max_iterations
+        )
+
+    async def _synthesize_iteration_limit_response(
+        self,
+        *,
+        query: str,
+        messages: List[BaseMessage],
+        tool_envelopes: List[Dict[str, Any]],
+        iteration_count: int,
+        max_iterations: int,
+    ) -> str:
+        """达到工具循环预算时，用已捕获状态请求 LLM 完成终态回答。"""
+
+        return await synthesize_terminal_response(
+            self.llm,
+            config=TerminalSynthesisConfig(
+                request_kind="chat_agent.iteration_limit_synthesis",
+                system_prompt=(
+                    "The chat workflow stopped because it reached its iteration budget "
+                    "before emitting terminal assistant text. Write the best possible final "
+                    "answer from the gathered conversation and tool evidence. Do not call "
+                    "tools. Do not invent evidence. State remaining uncertainty explicitly."
+                ),
+                messages_heading="Conversation tail",
+                evidence_heading="Structured tool evidence",
+                no_messages_text="No non-system conversation messages were captured.",
+                no_evidence_text="No structured tool result envelopes were captured.",
+                failure_log_message="Chat max-iteration synthesis failed: %s",
+                empty_log_message="Chat max-iteration synthesis returned empty text",
+                context_limit=self.ITERATION_LIMIT_SYNTHESIS_CONTEXT_LIMIT,
+                item_limit=self.ITERATION_LIMIT_SYNTHESIS_ITEM_LIMIT,
+                message_item_limit=self.ITERATION_LIMIT_SYNTHESIS_ITEM_LIMIT,
+                message_tail_limit=self.ITERATION_LIMIT_SYNTHESIS_MESSAGE_LIMIT,
+                include_system_messages=False,
+                detailed_message_headers=True,
+                empty_message_text="(no text content)",
+                message_omitted_unit="conversation messages",
+                evidence_omitted_unit="tool result envelopes",
+            ),
+            messages=messages,
+            tool_envelopes=tool_envelopes,
+            guarded_invoke=guarded_ainvoke,
+            failure_response_factory=lambda: build_deterministic_diagnostic_response(
+                query,
+                tool_envelopes,
+                agent_kind="chat",
+            ),
+            logger=logger,
+            human_prelude=f"Iteration budget: {iteration_count}/{max_iterations}",
+        )
 
     def _build_workflow(
         self,
@@ -319,6 +388,11 @@ User Query: {query}"""
             redis_instance=self.redis_instance,
             redis_cluster=self.redis_cluster,
             initial_target_bindings=initial_bindings or None,
+            initial_toolset_generation=int(
+                normalized_context.get("target_toolset_generation")
+                or normalized_context.get("toolset_generation")
+                or 0
+            ),
             exclude_mcp_categories=self.exclude_mcp_categories,
             support_package_path=support_package_path,
             thread_id=thread_id,
@@ -357,12 +431,26 @@ User Query: {query}"""
                 tool_envelopes = list(final_state.get("signals_envelopes") or [])
                 messages = list(final_state.get("messages") or [])
                 response_text = extract_last_ai_response(messages, terminal_only=True)
-                if not response_text:
-                    response_text = build_deterministic_diagnostic_response(
-                        query,
-                        tool_envelopes,
-                        agent_kind="chat",
+                if response_text:
+                    return AgentResponse(response=response_text, tool_envelopes=tool_envelopes)
+                if self._reached_iteration_limit(final_state, max_iterations):
+                    iteration_count = final_state.get("iteration_count", max_iterations)
+                    state_max_iterations = final_state.get("max_iterations", max_iterations)
+                    response_text = await self._synthesize_iteration_limit_response(
+                        query=query,
+                        messages=messages,
+                        tool_envelopes=tool_envelopes,
+                        iteration_count=(
+                            iteration_count if isinstance(iteration_count, int) else max_iterations
+                        ),
+                        max_iterations=(
+                            state_max_iterations
+                            if isinstance(state_max_iterations, int)
+                            else max_iterations
+                        ),
                     )
+                else:
+                    response_text = "I couldn't process that query. Please try rephrasing."
                 return AgentResponse(response=response_text, tool_envelopes=tool_envelopes)
             except Exception as exc:
                 logger.exception("Chat agent error: %s", exc)

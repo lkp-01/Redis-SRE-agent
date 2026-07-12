@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from .helpers import coerce_response_text
 
@@ -43,6 +43,10 @@ class TerminalSynthesisConfig:
     message_tail_limit: int = 12
     evidence_tail_limit: int = 8
     include_system_messages: bool = True
+    detailed_message_headers: bool = False
+    empty_message_text: str | None = None
+    message_omitted_unit: str = "conversation message(s)"
+    evidence_omitted_unit: str = "tool result envelope(s)"
 
 
 def _safe_text(value: Any, max_chars: int = 500) -> str:
@@ -104,12 +108,32 @@ def format_terminal_synthesis_messages(
     lines = []
     omitted = len(visible) - len(selected)
     if omitted > 0:
-        lines.append(f"... [{omitted} earlier conversation message(s) omitted]")
+        lines.append(f"... [{omitted} earlier {config.message_omitted_unit} omitted]")
     for message in selected:
         role = getattr(message, "type", message.__class__.__name__)
         content = coerce_response_text(getattr(message, "content", ""))
+        if not content and isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            content = json.dumps(message.tool_calls, ensure_ascii=False, default=str)
+        if not content and config.empty_message_text is not None:
+            content = config.empty_message_text
+        if not config.detailed_message_headers:
+            lines.append(
+                f"{role}: {truncate_terminal_synthesis_text(content, config.message_item_limit)}"
+            )
+            continue
+        header = str(role)
+        tool_calls = getattr(message, "tool_calls", None) or []
+        tool_names = [
+            str(call.get("name"))
+            for call in tool_calls
+            if isinstance(call, dict) and call.get("name")
+        ]
+        if tool_names:
+            header = f"{header} requested tools: {', '.join(tool_names)}"
+        if isinstance(message, ToolMessage) and getattr(message, "name", None):
+            header = f"{header} ({message.name})"
         lines.append(
-            f"{role}: {truncate_terminal_synthesis_text(content, config.message_item_limit)}"
+            f"{header}:\n{truncate_terminal_synthesis_text(content, config.message_item_limit)}"
         )
     return truncate_terminal_synthesis_text("\n\n".join(lines), config.context_limit)
 
@@ -133,7 +157,7 @@ def format_terminal_synthesis_tool_evidence(
     omitted = len(tool_envelopes) - len(selected)
     # 如果有被忽略的结果，在开头添加一行提示，表明前面有多少条记录被省略了
     if omitted > 0:
-        lines.append(f"... [{omitted} earlier tool result envelope(s) omitted]")
+        lines.append(f"... [{omitted} earlier {config.evidence_omitted_unit} omitted]")
 
     # 遍历筛选出来的每一个工具结果信封
     for envelope in selected:

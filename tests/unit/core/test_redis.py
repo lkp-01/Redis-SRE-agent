@@ -10,18 +10,24 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from redis_sre_agent.core.redis import (
+    LightweightSearchIndex,
     SRE_CLUSTERS_SCHEMA,
     SRE_INSTANCES_SCHEMA,
+    SRE_THREADS_SCHEMA,
     get_clusters_index,
     get_instances_index,
     get_redis_client,
+    get_threads_index,
     test_redis_connection,
 )
+from redis_sre_agent.core.redisearch import CountQuery, FilterQuery, Tag, tag_contains_expression
+from tests.support.fake_redis import FakeRedis
 
 
 def test_instance_and_cluster_schemas_are_present() -> None:
     assert SRE_INSTANCES_SCHEMA["index"]["name"] == "sre_instances"
     assert SRE_CLUSTERS_SCHEMA["index"]["name"] == "sre_clusters"
+    assert SRE_THREADS_SCHEMA["index"]["name"] == "sre_threads"
     assert {"name", "environment", "status"}.issubset(
         {field["name"] for field in SRE_INSTANCES_SCHEMA["fields"]}
     )
@@ -42,9 +48,11 @@ async def test_get_indices_return_lightweight_index_objects() -> None:
     with patch("redis_sre_agent.core.redis.get_redis_client", return_value=AsyncMock()):
         instances_index = await get_instances_index()
         clusters_index = await get_clusters_index()
+        threads_index = await get_threads_index()
 
     assert instances_index.name == "sre_instances"
     assert clusters_index.name == "sre_clusters"
+    assert threads_index.name == "sre_threads"
 
 
 @pytest.mark.asyncio
@@ -56,3 +64,55 @@ async def test_redis_connection_uses_mock_client() -> None:
         assert await test_redis_connection() is True
 
     client.ping.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lightweight_index_scans_filters_sorts_and_pages_hash_documents() -> None:
+    redis = FakeRedis()
+    await redis.hset(
+        "sre_instances:one",
+        mapping={
+            "name": "Prod Checkout Cache",
+            "environment": "production",
+            "status": "active",
+            "updated_at": "10",
+            "data": '{"id":"one"}',
+        },
+    )
+    await redis.hset(
+        "sre_instances:two",
+        mapping={
+            "name": "Prod Session Cache",
+            "environment": "production",
+            "status": "active",
+            "updated_at": "20",
+            "data": '{"id":"two"}',
+        },
+    )
+    await redis.hset(
+        "sre_instances:three",
+        mapping={
+            "name": "Dev Checkout Cache",
+            "environment": "development",
+            "status": "active",
+            "updated_at": "30",
+            "data": '{"id":"three"}',
+        },
+    )
+    index = LightweightSearchIndex(SRE_INSTANCES_SCHEMA, redis)
+
+    assert await index.query(CountQuery(filter_expression="*")) == 3
+
+    expression = (Tag("environment") == "production") & tag_contains_expression(
+        "name", "cache"
+    )
+    query = FilterQuery(
+        filter_expression=expression,
+        return_fields=["data", "updated_at"],
+        num_results=10,
+    ).sort_by("updated_at", asc=False)
+    query.paging(1, 1)
+
+    assert await index.query(query) == [
+        {"data": '{"id":"one"}', "updated_at": "10"}
+    ]

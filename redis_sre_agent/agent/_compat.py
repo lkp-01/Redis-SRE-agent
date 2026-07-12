@@ -16,7 +16,6 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .helpers import coerce_response_text, extract_tool_operation_name
-from .terminal_synthesis import build_deterministic_diagnostic_response
 
 
 def _message_text(value: Any) -> str:
@@ -115,6 +114,56 @@ def _tool_call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[st
     }
 
 
+def _fake_final_text(query: str, agent_kind: str) -> str:
+    """测试 LLM 的可识别终态文本，不承担正式诊断推理。"""
+
+    if agent_kind == "triage":
+        return (
+            "## Initial Assessment\nFake triage assessment for local tests.\n\n"
+            "## What I'm Seeing\nTool evidence was collected.\n\n"
+            "## My Recommendation\nReview the captured evidence.\n\n"
+            "## Supporting Info\nLocal fake LLM output."
+        )
+    return (
+        f"# Redis 诊断摘要\n\n查询：{query}\n\n"
+        "## Evidence 摘要\n工具 evidence 已收集。\n\n"
+        "## 下一步建议\n请根据 evidence 继续分析。"
+    )
+
+
+class _FakeStructuredLLM:
+    def __init__(self, parent: "FakeToolCallingLLM", schema: Any) -> None:
+        self.parent = parent
+        self.schema = schema
+
+    async def ainvoke(self, messages: Sequence[Any]) -> Any:
+        from .models import Recommendation, RecommendationStep, Topic, TopicsList
+
+        if self.schema is TopicsList:
+            payload = "\n".join(_message_text(getattr(message, "content", "")) for message in messages)
+            keys = re.findall(r'"tool_key"\s*:\s*"([^"]+)"', payload)
+            return TopicsList(
+                items=[
+                    Topic(
+                        id="T1",
+                        title="Redis diagnostic evidence",
+                        category="Performance",
+                        severity="medium",
+                        narrative="Review the captured Redis signals.",
+                        evidence_keys=keys[:3],
+                    )
+                ]
+            )
+        if self.schema is Recommendation:
+            return Recommendation(
+                topic_id="T1",
+                title="Redis diagnostic evidence",
+                steps=[RecommendationStep(description="Review the captured tool evidence.")],
+                verification=["Confirm the relevant Redis metrics again."],
+            )
+        raise TypeError(f"Unsupported fake structured schema: {self.schema}")
+
+
 def _diagnostic_goals(agent_kind: str) -> List[tuple[str, Dict[str, Any]]]:
     goals: List[tuple[str, Dict[str, Any]]] = [
         ("info", {"section": "memory"}),
@@ -156,7 +205,22 @@ class FakeToolCallingLLM:
         bound._tools = list(tools or [])
         return bound
 
+    def with_structured_output(self, schema: Any, **_: Any) -> _FakeStructuredLLM:
+        return _FakeStructuredLLM(self, schema)
+
     async def ainvoke(self, messages: Sequence[Any]) -> AIMessage:
+        system_text = "\n".join(
+            _message_text(getattr(message, "content", ""))
+            for message in messages
+            if getattr(message, "type", "") == "system"
+        )
+        if "careful technical editor" in system_text:
+            return AIMessage(content=_fake_final_text(_last_user_query(messages), "triage"))
+        if "research and then synthesize recommendations" in system_text:
+            return AIMessage(content="Evidence is sufficient for structured synthesis.")
+        if "iteration budget" in system_text or "final Redis triage response" in system_text:
+            return AIMessage(content=_fake_final_text(_last_user_query(messages), self.agent_kind))
+
         query = _last_user_query(messages)
         target_hint = _last_target_hint(messages)
         envelopes = _envelopes_from_tool_messages(messages)
@@ -196,13 +260,7 @@ class FakeToolCallingLLM:
                         )
                     ],
                 )
-            return AIMessage(
-                content=build_deterministic_diagnostic_response(
-                    query,
-                    envelopes,
-                    agent_kind=self.agent_kind,
-                )
-            )
+            return AIMessage(content=_fake_final_text(query, self.agent_kind))
 
         pending: List[Dict[str, Any]] = []
         for operation, args in _diagnostic_goals(self.agent_kind):
@@ -228,13 +286,7 @@ class FakeToolCallingLLM:
                     tool_calls=[_tool_call(tool_name, {"index_name": index_name})],
                 )
 
-        return AIMessage(
-            content=build_deterministic_diagnostic_response(
-                query,
-                envelopes,
-                agent_kind=self.agent_kind,
-            )
-        )
+        return AIMessage(content=_fake_final_text(query, self.agent_kind))
 
     @staticmethod
     def _first_search_index(envelopes: Sequence[Dict[str, Any]]) -> Optional[str]:

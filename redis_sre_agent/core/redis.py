@@ -26,11 +26,13 @@ test_redis_connection（网络探针）这就是个“网络测线仪”。它�
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from redis.asyncio import Redis
 
 from redis_sre_agent.core.config import Settings, settings
+from redis_sre_agent.core.redisearch import CountQuery, FilterQuery
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,23 @@ SRE_TARGETS_SCHEMA = {
     ],
 }
 
+SRE_THREADS_SCHEMA = {
+    "index": {
+        "name": SRE_THREADS_INDEX,
+        "prefix": f"{SRE_THREADS_INDEX}:",
+        "storage_type": "hash",
+    },
+    "fields": [
+        {"name": "subject", "type": "text"},
+        {"name": "user_id", "type": "tag"},
+        {"name": "instance_id", "type": "tag"},
+        {"name": "priority", "type": "numeric"},
+        {"name": "created_at", "type": "numeric"},
+        {"name": "updated_at", "type": "numeric"},
+        {"name": "tags", "type": "tag"},
+    ],
+}
+
 
 class LightweightSearchIndex:
     """阶段二轻量索引对象。
@@ -131,7 +150,81 @@ class LightweightSearchIndex:
         return None
 
     async def query(self, query: Any) -> list[dict[str, Any]] | int:
-        raise NotImplementedError("阶段二 LightweightSearchIndex 不执行真实 RediSearch 查询。")
+        """在没有 RediSearch module 时，对小型 Hash 目录执行兼容查询。
+
+        这里只解释本项目 `core.redisearch` 生成的 CountQuery、FilterQuery 和 AND TAG
+        表达式。使用 SCAN 而不是 KEYS，避免阻塞系统 Redis；完整全文/向量搜索仍不在本阶段。
+        """
+
+        prefix = str(self.schema["index"]["prefix"])
+        documents: list[dict[str, Any]] = []
+        async for raw_key in self._redis_client.scan_iter(match=f"{prefix}*"):
+            raw_document = await self._redis_client.hgetall(raw_key)
+            document = {
+                self._decode(key): self._decode(value)
+                for key, value in (raw_document or {}).items()
+            }
+            if self._matches_filter(document, getattr(query, "filter_expression", "*")):
+                documents.append(document)
+
+        if isinstance(query, CountQuery):
+            return len(documents)
+        if not isinstance(query, FilterQuery):
+            raise TypeError(f"Unsupported lightweight index query: {type(query).__name__}")
+
+        sort_field = query.sort_field
+        if sort_field:
+            numeric_fields = {
+                field["name"]
+                for field in self.schema.get("fields", [])
+                if field.get("type") == "numeric"
+            }
+
+            def sort_value(document: dict[str, Any]) -> Any:
+                value = document.get(sort_field, "")
+                if sort_field in numeric_fields:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return float("-inf")
+                return str(value).casefold()
+
+            documents.sort(key=sort_value, reverse=not query.sort_asc)
+
+        offset = max(0, int(query.offset))
+        limit = max(0, int(query.limit))
+        page = documents[offset : offset + limit]
+        if not query.return_fields:
+            return page
+        return [
+            {field: document.get(field) for field in query.return_fields}
+            for document in page
+        ]
+
+    @staticmethod
+    def _decode(value: Any) -> str:
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+    @staticmethod
+    def _matches_filter(document: dict[str, Any], filter_expression: Any) -> bool:
+        expression = str(filter_expression or "*").strip()
+        if expression in {"", "*"}:
+            return True
+
+        clauses = re.findall(r"@([A-Za-z0-9_]+):\{((?:\\.|[^}])*)\}", expression)
+        if not clauses:
+            return False
+        for field, raw_expected in clauses:
+            contains = raw_expected.startswith("*") and raw_expected.endswith("*")
+            expected = raw_expected[1:-1] if contains else raw_expected
+            expected = re.sub(r"\\(.)", r"\1", expected).casefold()
+            actual = str(document.get(field, "")).casefold()
+            if contains:
+                if expected not in actual:
+                    return False
+            elif actual != expected:
+                return False
+        return True
 
 # 这个函数负责创建 Redis 客户端。上层代码想访问 Redis，必须先有一个客户端对象；这个函数就是统一的“造客户端入口”。
 # 如果调用者传了 url，就用传入的地址；如果没传，就从配置 settings 里拿 redis_url。
@@ -161,6 +254,14 @@ async def get_targets_index(config: Optional[Settings] = None) -> LightweightSea
     cfg = config or settings
     client = get_redis_client(url=cfg.redis_url.get_secret_value(), config=cfg)
     return LightweightSearchIndex(SRE_TARGETS_SCHEMA, client)
+
+
+async def get_threads_index(config: Optional[Settings] = None) -> LightweightSearchIndex:
+    """返回 Thread 搜索索引入口；本阶段不扩展其他索引行为。"""
+
+    cfg = config or settings
+    client = get_redis_client(url=cfg.redis_url.get_secret_value(), config=cfg)
+    return LightweightSearchIndex(SRE_THREADS_SCHEMA, client)
 
 #检查 Redis 是否能连通
 async def test_redis_connection(

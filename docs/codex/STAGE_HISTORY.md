@@ -1,5 +1,84 @@
 # Stage History
 
+## 2026-07-12 Live smoke compatibility fixes
+
+### 完成内容
+
+- 为现有 `LightweightSearchIndex.query()` 增加小型 Hash 目录的 `SCAN + HGETALL` fallback，支持当前资源层使用的 CountQuery、FilterQuery、AND TAG 过滤、排序和分页。
+- 当前系统 Redis 没有 RediSearch module，fallback 不新增 redisvl 依赖，也不恢复完整全文/向量搜索。
+- DeepSeek 的 TopicsList 与 Recommendation structured output 显式改用 `method="function_calling"`，避免不支持的 response_format/json_schema。
+- CLI JSON 输出根据 stdout 编码使用 `backslashreplace`；Windows GBK 下中文仍可输出，emoji 等不可编码字符转为合法 JSON escape。
+
+### 对抗性审查结论
+
+- 没有增加 Repository、ORM、新索引层或依赖。
+- 资源调用方仍保持 original 的 `index.query()` 形状；Triage 仍保持 original structured-output 主线。
+- fallback 使用增量 SCAN，不使用阻塞式 KEYS；只扫描 schema prefix。
+- LLM Provider、模型、工具循环和 failover 均未改变。
+
+### 验证结果
+
+- focused Redis/structured/GBK tests：通过。
+- target discovery live：自然语言匹配 1 个实例，生成 binding 和 generation，随后动态加载 Redis provider 并执行 `INFO memory`。
+- DeepSeek live structured：TopicsList 与 Recommendation 均返回对应 Pydantic model；完整 Triage 不再出现 HTTP 400。
+- Thread live：第二个独立进程恢复 4 条历史消息、1 个 target binding、target handle 和 generation=1。
+- `python -m compileall redis_sre_agent tests`：通过。
+- `git diff --check`：通过。
+- 全量测试：88 passed，2 skipped；跳过项为既有显式 live DeepSeek 测试。
+
+### 已知限制
+
+- SCAN fallback 是 O(N)，适合当前裁剪版的小型实例/集群目录，不替代完整 RediSearch。
+- Recommendation live smoke 仍观察到无知识来源时生成未被 evidence/citation 支持的写命令建议；命令没有执行，但后续需要在 recommendation worker 内加强 grounding，不应通过引入 Safety Corrector 绕开问题。
+
+## 2026-07-12 LLM 最终回答与 Redis Thread 持久化
+
+### 完成内容
+
+- Chat 保持 `agent -> tools -> agent -> END`；正常结束直接返回工具循环后的最后一条 AIMessage。
+- Chat 达到最大迭代且没有终态文本时，使用 messages 与 tool envelopes 做 LLM terminal synthesis；只有异常或空文本才使用确定性报告。
+- Triage 保持 `agent -> tools -> agent -> reasoning -> END`；reasoning 恢复 evidence summary、TopicsList、severity 排序/限量、Recommendation worker 和统一 Markdown composer。
+- TopicsList 为空或提取失败时先做 LLM terminal synthesis；composer/terminal synthesis 异常时才进入确定性降级。
+- 新增裁剪版 `agent/subgraphs/recommendation_worker.py`，保留 original 的短工具循环和 structured Recommendation；只使用现有 evidence、现有 knowledge 插槽与本地 `expand_evidence`。
+- 删除 Thread 的 `_THREADS`、`_MESSAGE_TRACES` 进程内 backend，改用系统 Redis List/Hash/String。
+- Thread 与 message 使用 26 位 ULID 形状；Thread TTL 为 24 小时，message trace TTL 为 7 天。
+- CLI 使用系统 Redis client；从 Redis 恢复 session/user/instance/cluster/context，只回灌 user/assistant 历史；Agent 成功后一次追加本轮 user/assistant，trace 按 assistant message ID 独立保存。
+- 两次独立 Python CLI 进程已验证历史、context、instance、target bindings、toolset generation 与 message trace 均可跨进程恢复。
+
+### 从 original 复制或适配的函数形状
+
+- `agent/chat_agent.py`：`_reached_iteration_limit()`、`_synthesize_iteration_limit_response()`、`process_query()` 的终态提取顺序。
+- `agent/langgraph_agent.py`：`_summarize_envelopes_for_reasoning()`、`_build_expand_evidence_tool()`、`_compose_final_markdown()` 与 `reasoning_node()` 的 topic map/reduce 主线。
+- `agent/subgraphs/recommendation_worker.py`：`RecState`、`build_recommendation_worker()`、`llm_node()`、`tools_node()`、`should_continue()`、`synth_node()`。
+- `agent/terminal_synthesis.py`：`TerminalSynthesisConfig`、消息/evidence 格式化和 `synthesize_terminal_response()`。
+- `core/threads.py`：`Message`、`ThreadMetadata`、`Thread` 与 ThreadManager 的 create/get/update/append/save/trace 方法。
+- `core/keys.py`：`message_decision_trace()` 与 original Thread key 字符串。
+- `core/redis.py`：`SRE_THREADS_SCHEMA`、`get_threads_index()`。
+- `cli/query.py`：系统 Redis client、Thread 恢复、history 转换、Agent 调用、成对消息追加和 trace 保存顺序。
+
+### 最小兼容适配
+
+- 当前依赖没有 `ulid`，且本阶段禁止修改依赖配置，因此使用标准库生成相同的 26 位 Crockford Base32 ULID 形状。
+- 当前没有完整知识 Provider；Recommendation worker 不虚构 Provider，只保留现有 knowledge 插槽和本地 `expand_evidence`。
+- Thread subject 保留确定性截断，不恢复与本阶段无关的 LLM 标题生成。
+
+### 有意保留的插槽
+
+- LangGraph Redis checkpoint/resume、API、Docket worker、scheduler。
+- MCP、RAG ingestion、Knowledge Agent、Safety Fact Corrector、Agent Memory。
+- Feedback、Observability、Support Package。
+- 完整 RedisVL Thread 搜索/list/delete 行为；本阶段只补 schema 与 index 入口。
+
+### 验证结果
+
+- Agent 新增终态/structured pipeline 测试：通过。
+- Redis Thread List/Hash/String、TTL、ULID、跨 manager 测试：通过。
+- 两次独立 CLI 进程真实系统 Redis 测试：通过。
+- Stage 5 target discovery、ToolManager、RedisCommandToolProvider 回归：通过。
+- `python -m compileall redis_sre_agent tests`：通过。
+- `git diff --check`：通过。
+- 全量测试：88 collected，86 passed，2 skipped；跳过项为既有显式 live DeepSeek 测试。
+
 ## 2026-07-12 Stage 5 DeepSeek LLM integration
 
 ### 完成内容

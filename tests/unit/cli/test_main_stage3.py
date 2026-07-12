@@ -3,21 +3,54 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 from pydantic import SecretStr
 
 from redis_sre_agent.cli.main import main
+from redis_sre_agent.cli.query import _render_json_for_output
+from redis_sre_agent.agent._compat import FakeToolCallingLLM
+from redis_sre_agent.agent.chat_agent import ChatAgent
+from redis_sre_agent.agent.router import AgentType
 from redis_sre_agent.core import targets as targets_module
+from redis_sre_agent.core import threads as threads_module
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.core.threads import ThreadManager
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
+from tests.support.fake_redis import FakeRedis
 
 
 _PASSWORD = "stage5-cli-password"
 _URL = f"redis://default:{_PASSWORD}@cache.internal:6379/0"
+
+
+@pytest.fixture(autouse=True)
+def fake_system_redis(monkeypatch):
+    """CLI unit tests share Redis semantics without depending on an external server."""
+
+    redis = FakeRedis()
+    query_module = importlib.import_module("redis_sre_agent.cli.query")
+    monkeypatch.setattr(query_module, "get_redis_client", lambda: redis)
+    monkeypatch.setattr(threads_module, "get_redis_client", lambda _url=None: redis)
+    monkeypatch.setattr(
+        query_module,
+        "get_chat_agent",
+        lambda redis_instance=None, redis_cluster=None: ChatAgent(
+            redis_instance=redis_instance,
+            redis_cluster=redis_cluster,
+            llm=FakeToolCallingLLM(agent_kind="chat"),
+        ),
+    )
+
+    async def route_to_chat(**_: Any) -> AgentType:
+        return AgentType.REDIS_CHAT
+
+    monkeypatch.setattr(query_module, "route_to_appropriate_agent", route_to_chat)
+    return redis
 
 
 class FakeCliRedisClient:
@@ -67,6 +100,17 @@ def test_cli_status_reports_stage_five() -> None:
 
     assert result.exit_code == 0
     assert "Stage 5" in result.output
+
+
+def test_cli_json_output_escapes_only_characters_unsupported_by_gbk() -> None:
+    payload = {"response": "诊断完成 ✅", "thread_id": "thread-1"}
+
+    rendered = _render_json_for_output(payload, encoding="gbk")
+
+    assert json.loads(rendered) == payload
+    assert "诊断完成" in rendered
+    assert "\\u2705" in rendered
+    rendered.encode("gbk")
 
 
 def test_cli_lazy_group_exposes_query_help_and_version() -> None:

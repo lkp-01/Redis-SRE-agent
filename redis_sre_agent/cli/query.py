@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 from typing import Optional
-from uuid import uuid4
 
 import click
 from langchain_core.messages import AIMessage, HumanMessage
@@ -19,9 +18,24 @@ from redis_sre_agent.agent.langgraph_agent import get_sre_agent
 from redis_sre_agent.agent.router import AgentType, route_to_appropriate_agent
 from redis_sre_agent.cli.logging_utils import log_cli_exception
 from redis_sre_agent.core.config import settings
-from redis_sre_agent.core.threads import ThreadManager
+from redis_sre_agent.core.redis import get_redis_client
+from redis_sre_agent.core.threads import ThreadManager, _new_ulid
 
 logger = logging.getLogger(__name__)
+
+
+def _render_json_for_output(payload: object, *, encoding: Optional[str] = None) -> str:
+    """生成适合当前终端编码、同时保持可解析的 JSON。"""
+
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    target_encoding = encoding or getattr(click.get_text_stream("stdout"), "encoding", None)
+    target_encoding = target_encoding or "utf-8"
+    try:
+        return rendered.encode(target_encoding, errors="backslashreplace").decode(
+            target_encoding
+        )
+    except LookupError:
+        return json.dumps(payload, ensure_ascii=True, indent=2, default=str)
 
 
 @click.command() #意思是query现在是可以直接在终端运行的cli命令
@@ -67,7 +81,8 @@ def query(
                 "Please provide only one of --redis-instance-id or --redis-cluster-id"
             )
 
-        thread_manager = ThreadManager() ##
+        redis_client = get_redis_client()
+        thread_manager = ThreadManager(redis_client=redis_client)
 
         instance = None
         if redis_instance_id:
@@ -99,14 +114,13 @@ def query(
                     conversation_history.append(HumanMessage(content=message.content))
                 elif message.role == "assistant":# 如果是 AI 助手回的消息，将其转换为 LangChain 标准的 AIMessage 对象，并追加到历史列表
                     conversation_history.append(AIMessage(content=message.content))
-                    # 兜底容错逻辑 1：如果用户本次运行命令行时没有传 --redis-instance-id 和 --redis-cluster-id，
-                    # 并且历史 Thread 上下文中存有 instance_id，则自动去数据库查出该 Redis 实例对象并恢复
-                    if not instance and not cluster and thread.context.get("instance_id"):
-                        instance = await instances_module.get_instance_by_id(thread.context["instance_id"])##
-                    if not instance and not cluster and thread.context.get("cluster_id"):
-                        cluster = await clusters_module.get_cluster_by_id(thread.context["cluster_id"])
+            # 本轮未显式给 target 时，从 Redis Thread context 恢复旧作用域。
+            if not instance and not cluster and thread.context.get("instance_id"):
+                instance = await instances_module.get_instance_by_id(thread.context["instance_id"])##
+            if not instance and not cluster and thread.context.get("cluster_id"):
+                cluster = await clusters_module.get_cluster_by_id(thread.context["cluster_id"])
         else:# 如果用户没有指定 --thread-id，说明这是一个全新的提问会话
-            active_session_id = f"cli:{uuid4()}" #创建一个全新session_id
+            active_session_id = f"cli:{_new_ulid()}" #创建一个全新session_id
             initial_context = {} #新字典，放上下文
             # 如果用户在命令行传入了具体的 Redis 实例/集群/故障包/目标提示 ID，记录到初始上下文中
             if redis_instance_id:
@@ -177,11 +191,6 @@ def query(
         else:
             selected_agent = get_chat_agent(redis_instance=instance, redis_cluster=cluster)
 
-        await thread_manager.append_messages( # 用户本次问题追加到该线程的历史消息里
-            active_thread_id,
-            [{"role": "user", "content": query}],
-        )
-
         agent_response = await selected_agent.process_query(
             query,
             session_id=active_session_id or active_thread_id or "cli",
@@ -191,16 +200,17 @@ def query(
             conversation_history=conversation_history or None,
         )
 
-        assistant_message_id = str(uuid4())
+        assistant_message_id = _new_ulid()
         if agent_response.tool_envelopes:## 链路追踪追踪（Trace）：如果 Agent 在思考过程中调用了任何底层工具并返回了证据包（tool_envelopes）
             await thread_manager.set_message_trace(
                 message_id=assistant_message_id,
                 tool_envelopes=agent_response.tool_envelopes,
             )
 
-        await thread_manager.append_messages( # 将 AI 助手的最终文本回答，连同刚刚生成的 message_id 扩展元数据，正式追加持久化到线程历史消息库中
+        await thread_manager.append_messages( # 一次性保存完整一问一答，避免 Agent 失败留下半轮历史
             active_thread_id,
             [
+                {"role": "user", "content": query},
                 {
                     "role": "assistant",
                     "content": agent_response.response,
@@ -211,7 +221,7 @@ def query(
 
         payload = agent_response.model_dump(mode="json")# 将 Pydantic 模型对象转为标准的 Python 纯 JSON 序列化字典数据
         payload["thread_id"] = active_thread_id #返回给终端的数据载荷中补上当前的线程 ID，方便终端用户或调用者后续追踪
-        click.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str)) #到屏幕
+        click.echo(_render_json_for_output(payload)) #到屏幕
 
     #执行上面定义好的异步内部函数 _query()
     try:

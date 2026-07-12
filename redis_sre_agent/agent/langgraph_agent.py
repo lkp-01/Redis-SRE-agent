@@ -8,11 +8,14 @@ safety corrector 等平台能力只保留插槽。
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langgraph.graph import END, StateGraph
 
 from redis_sre_agent.core.clusters import RedisCluster
@@ -26,12 +29,17 @@ from .helpers import (
     build_adapters_for_tooldefs,
     build_graph_config,
     build_result_envelope,
+    coerce_response_text,
     extract_last_ai_response,
     guarded_ainvoke,
     resolve_graph_thread_id,
 )
-from .models import AgentResponse
-from .terminal_synthesis import build_deterministic_diagnostic_response
+from .models import AgentResponse, TopicsList
+from .terminal_synthesis import (
+    TerminalSynthesisConfig,
+    build_deterministic_diagnostic_response,
+    synthesize_terminal_response,
+)
 from .tool_execution import execute_tool_calls_with_gate
 
 logger = logging.getLogger(__name__)
@@ -74,6 +82,7 @@ class SRELangGraphAgent:
         llm: Optional[Any] = None, #自定义底层大语言模型实例
         **_: Any, #接受并忽略其它不关心的多余关键字参数
     ):
+        llm_was_injected = llm is not None
         self.settings = settings # 全局配置对象挂载到实例属性上
         self.redis_instance = redis_instance
         self.redis_cluster = redis_cluster
@@ -92,9 +101,159 @@ class SRELangGraphAgent:
 
                 llm = FakeToolCallingLLM(agent_kind="triage")
         self.llm = llm
+        if llm_was_injected:
+            # 显式注入的 LLM 同时承担 structured/composer 测试路径。
+            self.mini_llm = llm
+        elif settings.openai_api_key is not None:
+            from redis_sre_agent.core.llm_helpers import create_mini_llm
+
+            self.mini_llm = create_mini_llm()
+        else:
+            self.mini_llm = llm
         self.llm_with_tools = self.llm
         # 如果后续完全不需要绑定任何工具，它就直接用原地址；
         # 而一旦需要绑定工具，工作流内部会动态把新地址分配给运行时去消费。
+
+    async def _summarize_envelopes_for_reasoning(
+        self,
+        envelopes: List[Dict[str, Any]],
+        max_data_chars: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """为大 payload 补 summary，同时保留原始 data。"""
+
+        summarized: List[Dict[str, Any]] = []
+        for envelope in envelopes or []:
+            item = dict(envelope)
+            data_text = json.dumps(item.get("data") or {}, ensure_ascii=False, default=str)
+            if len(data_text) <= max_data_chars or item.get("summary"):
+                summarized.append(item)
+                continue
+            try:
+                response = await guarded_ainvoke(
+                    self.mini_llm,
+                    [
+                        HumanMessage(
+                            content=(
+                                "Summarize this Redis tool evidence in 2-3 sentences. Preserve "
+                                "exact metrics and errors; add no facts:\n" + data_text[:2000]
+                            )
+                        )
+                    ],
+                    request_kind="langgraph_agent.envelope_summarizer",
+                )
+                summary = coerce_response_text(getattr(response, "content", ""))
+            except Exception as exc:
+                logger.warning("Envelope summarization failed: %s", exc)
+                summary = ""
+            item["summary"] = summary or (data_text[:max_data_chars] + "...")
+            summarized.append(item)
+        return summarized
+
+    def _build_expand_evidence_tool(
+        self,
+        original_envelopes: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """让 recommendation worker 按 tool_key 读取未截断 evidence。"""
+
+        originals_by_key = {item.get("tool_key"): item for item in original_envelopes}
+        available_keys = [key for key in originals_by_key if key]
+
+        def expand_evidence(tool_key: str) -> Dict[str, Any]:
+            original = originals_by_key.get(tool_key)
+            if original is None:
+                return {"status": "error", "error": f"Unknown tool_key: {tool_key}"}
+            return {
+                "status": "success",
+                "tool_key": tool_key,
+                "name": original.get("name"),
+                "description": original.get("description"),
+                "full_data": original.get("data"),
+            }
+
+        return {
+            "name": "expand_evidence",
+            "description": (
+                "Retrieve full unsummarized output from previous evidence. "
+                f"Available tool_keys: {available_keys}"
+            ),
+            "func": expand_evidence,
+        }
+
+    async def _compose_final_markdown(
+        self,
+        *,
+        initial_assessment_lines: List[str],
+        per_topic_recommendations: List[Dict[str, Any]],
+        instance_ctx: Optional[Dict[str, Any]],
+    ) -> str:
+        """按 original 固定章节让 LLM 统一编辑最终 Markdown。"""
+
+        payload = {
+            "initial_assessment_lines": initial_assessment_lines or [],
+            "per_topic_recommendations": per_topic_recommendations or [],
+            "instance": instance_ctx or {},
+        }
+        messages: List[BaseMessage] = [
+            SystemMessage(
+                content=(
+                    "You are a careful technical editor. Compose a final operator-facing report "
+                    "in Markdown. Use only the supplied JSON. Do not invent facts, commands, "
+                    "endpoints, sources, or metrics."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    "Produce one Markdown document with these headings exactly once and in order:\n"
+                    "## Initial Assessment\n## What I'm Seeing\n## My Recommendation\n"
+                    "## Supporting Info\n"
+                    "Deduplicate overlapping material. If a section is empty, write a short neutral "
+                    "sentence. Return Markdown only.\n\nJSON payload:\n"
+                    + json.dumps(payload, ensure_ascii=False, default=str)
+                )
+            ),
+        ]
+        response = await guarded_ainvoke(
+            self.mini_llm,
+            messages,
+            request_kind="langgraph_agent.composer",
+        )
+        return coerce_response_text(getattr(response, "content", ""))
+
+    async def _synthesize_reasoning_fallback(
+        self,
+        *,
+        query: str,
+        messages: List[BaseMessage],
+        tool_envelopes: List[Dict[str, Any]],
+    ) -> str:
+        """TopicsList 为空或提取失败时的兼容 terminal synthesis。"""
+
+        return await synthesize_terminal_response(
+            self.llm,
+            config=TerminalSynthesisConfig(
+                request_kind="langgraph_agent.topic_fallback_synthesis",
+                system_prompt=(
+                    "Produce the final Redis triage response from the captured conversation and "
+                    "tool evidence. Do not call tools or invent facts. Use Markdown and state "
+                    "uncertainty where evidence is incomplete."
+                ),
+                messages_heading="Conversation tail",
+                evidence_heading="Structured tool evidence",
+                context_limit=16000,
+                item_limit=2000,
+                message_item_limit=2000,
+                message_tail_limit=14,
+            ),
+            messages=messages,
+            tool_envelopes=tool_envelopes,
+            guarded_invoke=guarded_ainvoke,
+            failure_response_factory=lambda: build_deterministic_diagnostic_response(
+                query,
+                tool_envelopes,
+                agent_kind="triage",
+            ),
+            logger=logger,
+        )
 
     def _build_workflow(
         self,
@@ -267,30 +426,177 @@ class SRELangGraphAgent:
             }
 
         async def reasoning_node(state: AgentState) -> Dict[str, Any]:
-            """从已收集 evidence 生成最终回答。"""
+            """按 original 的 topic map/reduce 主线生成最终诊断报告。"""
 
             messages = list(state.get("messages") or [])
             envelopes = list(state.get("signals_envelopes") or [])
-            query = ""
+            query = next(
+                (
+                    str(message.content)
+                    for message in reversed(messages)
+                    if isinstance(message, HumanMessage)
+                ),
+                "",
+            )
+            summarized_envelopes = await self._summarize_envelopes_for_reasoning(envelopes)
+            instance_ctx = dict(state.get("instance_context") or {})
+            if target_instance is not None:
+                instance_ctx.update(
+                    {
+                        "id": target_instance.id,
+                        "name": target_instance.name,
+                        "instance_type": target_instance.instance_type,
+                    }
+                )
 
-            # 从后往前遍历历史消息，精准定位用户最初输入的那个 Human 原始问题
-            for message in reversed(messages):
-                if isinstance(message, HumanMessage):
-                    query = str(message.content)
-                    break
+            topics: List[Dict[str, Any]] = []
+            try:
+                extractor_llm = self.mini_llm.with_structured_output(
+                    TopicsList,
+                    method="function_calling",
+                )
+                extraction = await guarded_ainvoke(
+                    extractor_llm,
+                    [
+                        HumanMessage(
+                            content=(
+                                "Extract distinct Redis diagnostic topics from the supplied tool "
+                                "signals. Use only this evidence. Each topic must include id, title, "
+                                "category, severity, scope, narrative, and evidence_keys referencing "
+                                "tool_key. Severity must be critical, high, medium, or low.\n\n"
+                                f"Instance (JSON):\n{json.dumps(instance_ctx, default=str)}\n"
+                                "Signals (JSON):\n"
+                                + json.dumps(summarized_envelopes, default=str)
+                            )
+                        )
+                    ],
+                    request_kind="langgraph_agent.topics_extractor",
+                )
+                items = extraction.items if extraction is not None else []
+                topics = [
+                    item if isinstance(item, dict) else item.model_dump()
+                    for item in items
+                ]
+                severity_order = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+                topics.sort(
+                    key=lambda item: severity_order.get(
+                        str(item.get("severity") or "medium").lower(), 1
+                    ),
+                    reverse=True,
+                )
+                max_topics = int(getattr(self.settings, "max_recommendation_topics", 3) or 3)
+                topics = topics[:max_topics]
+            except Exception as exc:
+                logger.warning("Topic extraction failed: %s", exc)
 
-            # 调用一个确定性的文本模板函数，根据用户的原始问题和所有的工具调用信封（envelopes）
-            # 严格依据证据生成一份逻辑清晰、无幻觉的 SRE 诊断报告，包装成 AIMessage
-            response = AIMessage(
-                content=build_deterministic_diagnostic_response(
+            if not topics:
+                response_text = await self._synthesize_reasoning_fallback(
+                    query=query,
+                    messages=messages,
+                    tool_envelopes=envelopes,
+                )
+                return {
+                    "messages": messages + [AIMessage(content=response_text)],
+                    "signals_envelopes": envelopes,
+                }
+
+            try:
+                from redis_sre_agent.tools.models import ToolCapability
+
+                from .subgraphs.recommendation_worker import build_recommendation_worker
+
+                knowledge_definitions = tool_mgr.get_tools_for_capability(ToolCapability.KNOWLEDGE)
+                knowledge_adapters = await build_adapters_for_tooldefs(
+                    tool_mgr,
+                    knowledge_definitions,
+                )
+                expand_spec = self._build_expand_evidence_tool(envelopes)
+                expand_tool = StructuredTool.from_function(
+                    func=expand_spec["func"],
+                    name=expand_spec["name"],
+                    description=expand_spec["description"],
+                )
+                adapters = list(knowledge_adapters) + [expand_tool]
+                max_tool_steps = int(
+                    getattr(self.settings, "max_tool_calls_per_stage", 3) or 3
+                )
+                worker = build_recommendation_worker(
+                    self.mini_llm,
+                    adapters,
+                    max_tool_steps=max_tool_steps,
+                )
+                envelopes_by_key = {
+                    envelope.get("tool_key"): envelope for envelope in summarized_envelopes
+                }
+                tasks = []
+                for topic in topics:
+                    evidence = [
+                        envelopes_by_key[key]
+                        for key in topic.get("evidence_keys") or []
+                        if key in envelopes_by_key
+                    ]
+                    tasks.append(
+                        asyncio.create_task(
+                            worker.ainvoke(
+                                {
+                                    "messages": [
+                                        SystemMessage(
+                                            content=(
+                                                "You will research and then synthesize recommendations "
+                                                "for the given topic. Use expand_evidence only when a "
+                                                "summary lacks required detail."
+                                            )
+                                        ),
+                                        HumanMessage(
+                                            content=(
+                                                f"Topic: {json.dumps(topic, default=str)}\n"
+                                                f"Instance: {json.dumps(instance_ctx, default=str)}\n"
+                                                f"Evidence: {json.dumps(evidence, default=str)}"
+                                            )
+                                        ),
+                                    ],
+                                    "budget": max_tool_steps,
+                                    "topic": topic,
+                                    "evidence": evidence,
+                                    "instance": instance_ctx,
+                                }
+                            )
+                        )
+                    )
+                recommendation_states = await asyncio.gather(*tasks)
+                recommendations = [
+                    state_result["result"]
+                    for state_result in recommendation_states
+                    if state_result and state_result.get("result")
+                ]
+                initial_writeup = next(
+                    (
+                        coerce_response_text(message.content)
+                        for message in reversed(messages)
+                        if isinstance(message, AIMessage)
+                        and coerce_response_text(message.content)
+                    ),
+                    "",
+                )
+                response_text = await self._compose_final_markdown(
+                    initial_assessment_lines=[initial_writeup] if initial_writeup else [],
+                    per_topic_recommendations=recommendations,
+                    instance_ctx=instance_ctx,
+                )
+                if not response_text:
+                    raise ValueError("Final markdown composer returned empty text")
+            except Exception as exc:
+                logger.warning("Triage recommendation/composer failed: %s", exc, exc_info=True)
+                response_text = build_deterministic_diagnostic_response(
                     query,
                     envelopes,
                     agent_kind="triage",
                 )
-            )
 
-            # 返回最新的状态增量
-            return {"messages": messages + [response], "signals_envelopes": envelopes}
+            return {
+                "messages": messages + [AIMessage(content=response_text)],
+                "signals_envelopes": envelopes,
+            }
 
         def should_continue(state: AgentState) -> str:
             """决定继续工具循环、进入 reasoning，或结束。"""
@@ -440,6 +746,11 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
                 redis_instance=self.redis_instance,  # 注入当前 Redis 实例
                 redis_cluster=self.redis_cluster,  # 注入当前 Redis 集群
                 initial_target_bindings=initial_bindings or None,  # 注入初始绑定的目标
+                initial_toolset_generation=int(
+                    normalized_context.get("target_toolset_generation")
+                    or normalized_context.get("toolset_generation")
+                    or 0
+                ),
                 exclude_mcp_categories=self.exclude_mcp_categories,  # 过滤掉不需要的工具分类
                 support_package_path=support_package_path,  # 注入离线诊断包路径（如果有）
                 thread_id=thread_id,
@@ -504,13 +815,9 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
             # 尝试从消息记录的末尾提取大模型的最后一次发言（只提取纯文本回答）
             response_text = extract_last_ai_response(messages, terminal_only=True)
 
-            # 如果大模型由于某些原因（比如达到最大迭代次数）没有给出总结陈词
             if not response_text:
-                # 触发后备机制：用已收集到的工具数据，通过一个确定性的函数拼装一份报告
-                response_text = build_deterministic_diagnostic_response(
-                    query,
-                    tool_envelopes,
-                    agent_kind="triage",
+                response_text = (
+                    "I couldn't generate a final triage response. Please try rephrasing the query."
                 )
 
                 # 返回标准的格式化响应：包含文本回答和具体的工具执行记录

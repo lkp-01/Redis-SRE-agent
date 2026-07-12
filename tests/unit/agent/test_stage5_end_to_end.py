@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from redis_sre_agent.agent.chat_agent import ChatAgent
+from redis_sre_agent.agent._compat import FakeToolCallingLLM
 from redis_sre_agent.core import targets as targets_module
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.targets import redis_binding
@@ -123,7 +124,7 @@ async def test_stage5_agent_resolves_target_binds_tools_and_reports(monkeypatch)
     monkeypatch.setattr(redis_binding, "get_instance_by_id", fake_get_instance_by_id)
     monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
 
-    response = await ChatAgent().process_query(
+    response = await ChatAgent(llm=FakeToolCallingLLM(agent_kind="chat")).process_query(
         "check Prod Checkout Cache memory and slowlog",
         session_id="session-stage5-e2e",
         user_id="user-stage5",
