@@ -66,9 +66,20 @@ def test_extract_citations_reads_knowledge_results_only() -> None:
             {
                 "tool_key": "knowledge_abcdef_search",
                 "name": "search",
+                "status": "success",
                 "data": {
-                    "retrieval_kind": "dummy_knowledge",
-                    "results": [{"source": "redis-docs", "snippet": "memory"}],
+                    "status": "success",
+                    "retrieval_kind": "knowledge_search",
+                    "results": [
+                        {
+                            "title": "Memory runbook",
+                            "source": "file://shared/memory.md",
+                            "document_hash": "doc",
+                            "chunk_index": 0,
+                            "score": 0.1,
+                            "content": "Inspect INFO memory.",
+                        }
+                    ],
                 },
             },
         ]
@@ -76,12 +87,43 @@ def test_extract_citations_reads_knowledge_results_only() -> None:
 
     assert citations == [
         {
-            "source": "redis-docs",
-            "snippet": "memory",
-            "retrieval_kind": "dummy_knowledge",
+            "title": "Memory runbook",
+            "source": "file://shared/memory.md",
+            "document_hash": "doc",
+            "chunk_index": 0,
+            "score": 0.1,
+            "content": "Inspect INFO memory.",
+            "retrieval_kind": "knowledge_search",
             "retrieval_label": "Knowledge search",
         }
     ]
+
+
+def test_extract_citations_ignores_failed_or_sourceless_results() -> None:
+    citations = extract_citations(
+        [
+            {
+                "tool_key": "knowledge_abcdef_search",
+                "name": "search",
+                "status": "error",
+                "data": {
+                    "status": "failed",
+                    "results": [{"source": "must-not-leak"}],
+                },
+            },
+            {
+                "tool_key": "knowledge_abcdef_search",
+                "name": "search",
+                "status": "success",
+                "data": {
+                    "status": "success",
+                    "results": [{"title": "No authoritative source"}],
+                },
+            },
+        ]
+    )
+
+    assert citations == []
 
 
 def test_agent_response_derives_search_results_from_knowledge_envelopes() -> None:
@@ -91,9 +133,19 @@ def test_agent_response_derives_search_results_from_knowledge_envelopes() -> Non
             {
                 "tool_key": "knowledge_abcdef_search",
                 "name": "search",
+                "status": "success",
                 "data": {
-                    "retrieval_kind": "dummy_knowledge",
-                    "results": [{"source": "stage5", "snippet": "slot"}],
+                    "status": "success",
+                    "retrieval_kind": "knowledge_search",
+                    "results": [
+                        {
+                            "title": "Latency runbook",
+                            "source": "file://shared/latency.md",
+                            "document_hash": "doc",
+                            "chunk_index": 1,
+                            "score": 0.2,
+                        }
+                    ],
                 },
             }
         ],
@@ -101,9 +153,12 @@ def test_agent_response_derives_search_results_from_knowledge_envelopes() -> Non
 
     assert response.search_results == [
         {
-            "source": "stage5",
-            "snippet": "slot",
-            "retrieval_kind": "dummy_knowledge",
+            "title": "Latency runbook",
+            "source": "file://shared/latency.md",
+            "document_hash": "doc",
+            "chunk_index": 1,
+            "score": 0.2,
+            "retrieval_kind": "knowledge_search",
             "retrieval_label": "Knowledge search",
         }
     ]

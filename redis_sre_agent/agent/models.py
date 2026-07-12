@@ -85,11 +85,10 @@ class AgentResponse(BaseModel):
     tool_envelopes: List[Dict[str, Any]] = Field(default_factory=list)
 
     def model_post_init(self, __context: Any) -> None:
-        """未显式传 citation 时，从 knowledge 工具 envelope 中派生。"""
-        if not self.search_results and self.tool_envelopes:
-            from redis_sre_agent.agent.helpers import extract_citations
+        """citation 的唯一权威来源是顶层真实 tool_envelopes。"""
+        from redis_sre_agent.agent.helpers import extract_citations
 
-            object.__setattr__(self, "search_results", extract_citations(self.tool_envelopes))
+        object.__setattr__(self, "search_results", extract_citations(self.tool_envelopes))
 
 # 用来记录AI是怎么思考的记录留存
 class DecisionTrace(BaseModel):

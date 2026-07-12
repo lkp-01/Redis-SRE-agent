@@ -15,6 +15,8 @@ from redis_sre_agent.agent._compat import FakeToolCallingLLM
 from redis_sre_agent.agent.chat_agent import ChatAgent, get_chat_agent
 from redis_sre_agent.agent.models import AgentResponse
 from redis_sre_agent.core import llm_helpers
+from redis_sre_agent.core import redis as redis_core
+from redis_sre_agent.core.config import Settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
@@ -45,6 +47,34 @@ class FinalTextAfterToolLLM:
         return AIMessage(
             content="",
             tool_calls=[{"id": "call_final_text", "name": info_tool, "args": {}}],
+        )
+
+
+class KnowledgeSearchLLM:
+    def __init__(self) -> None:
+        self.tools: list[Any] = []
+
+    def bind_tools(self, tools: list[Any]) -> "KnowledgeSearchLLM":
+        self.tools = list(tools)
+        return self
+
+    async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        if any(isinstance(message, ToolMessage) for message in messages):
+            return AIMessage(content="Knowledge-grounded final answer")
+        tool = next(
+            item
+            for item in self.tools
+            if item.name.startswith("knowledge_") and item.name.endswith("search")
+        )
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "chat_knowledge_call",
+                    "name": tool.name,
+                    "args": {"query": "redis latency"},
+                }
+            ],
         )
 
 
@@ -221,3 +251,71 @@ async def test_chat_iteration_limit_uses_llm_terminal_synthesis(monkeypatch) -> 
 
     assert response.response == "FAKE_TERMINAL_SYNTHESIS"
     assert "Redis 诊断摘要" not in response.response
+
+
+@pytest.mark.asyncio
+async def test_chat_knowledge_search_enters_top_level_envelope_and_citation(monkeypatch) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+    import redis_sre_agent.tools.knowledge.knowledge_base as provider_module
+
+    monkeypatch.setattr(
+        manager_module,
+        "settings",
+        Settings(
+            _env_file=None,
+            rag_enabled=True,
+            embedding_api_key=SecretStr("TEST_EMBEDDING_KEY"),
+        ),
+    )
+
+    async def ready(_config=None):
+        return redis_core.RAGReadiness("ready", "ready", "RAG 已就绪。")
+
+    async def knowledge_result(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "retrieval_kind": "knowledge_search",
+            "retrieval_label": "Knowledge search",
+            "results": [
+                {
+                    "title": "Latency runbook",
+                    "source": "file://shared/latency.md",
+                    "document_hash": "doc-chat",
+                    "chunk_index": 0,
+                    "score": 0.12,
+                    "content": "Inspect SLOWLOG.",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(redis_core, "get_rag_readiness", ready)
+    monkeypatch.setattr(provider_module, "search_knowledge_base_helper", knowledge_result)
+    agent = ChatAgent(llm=KnowledgeSearchLLM())
+
+    response = await agent.process_query(
+        "find latency guidance",
+        session_id="session-chat-rag",
+        user_id=None,
+        context={"thread_id": "thread-chat-rag"},
+    )
+
+    knowledge_envelopes = [
+        envelope
+        for envelope in response.tool_envelopes
+        if envelope["tool_key"].startswith("knowledge_")
+    ]
+    assert response.response == "Knowledge-grounded final answer"
+    assert len(knowledge_envelopes) == 1
+    assert knowledge_envelopes[0]["data"]["results"][0]["document_hash"] == "doc-chat"
+    assert response.search_results == [
+        {
+            "title": "Latency runbook",
+            "source": "file://shared/latency.md",
+            "document_hash": "doc-chat",
+            "chunk_index": 0,
+            "score": 0.12,
+            "content": "Inspect SLOWLOG.",
+            "retrieval_kind": "knowledge_search",
+            "retrieval_label": "Knowledge search",
+        }
+    ]

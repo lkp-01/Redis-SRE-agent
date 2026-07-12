@@ -1,57 +1,63 @@
-# 当前阶段：Stage 5
+# 当前阶段：Stage 8
 
 ## 结论
 
-Stage 5 当前目标是“持久任务执行与可验证入口”的诊断切片收口。主链已经从 CLI 进入
-真实 LangGraph/LangChain message runtime，并通过 ToolManager 收集 Redis evidence。配置
-DeepSeek key 后，Agent 使用 `deepseek-v4-pro` 主模型和 `deepseek-v4-flash` 副模型；无 key
-时继续使用 fake LLM 支撑离线验证。
+Stage 8 已在现有 Stage 5 诊断主链上接入“本地 Markdown → embedding → Redis Vector
+Search → ToolManager knowledge search → Agent 顶层引用”的最小闭环。RAG 默认关闭，
+普通诊断不因此增加 Redis Search 或 embedding 依赖。
 
-## 主链路
+## RAG 状态与索引责任
+
+- `disabled`：不做 readiness 检查，不加载 knowledge provider。
+- `not_ready`：配置、Search/Vector、index 或 schema 不满足契约；不暴露 tool，并返回
+  `embedding_config_invalid`、`redis_search_unavailable`、`index_missing` 或
+  `schema_mismatch` 等脱敏 reason code。
+- `ready`：只有此状态才注册唯一只读 `knowledge_*_search`。
+
+`get_knowledge_index()` 不创建索引。普通 status/Agent/knowledge search 都使用只读检查；
+direct/prepared pipeline 摄取是唯一调用 `ensure_knowledge_index(create_if_missing=true)`
+的路径。
+
+## 摄取与检索主链
 
 ```text
-Click LazyGroup
--> redis_sre_agent.cli.query
--> ThreadManager.create_thread 或 get_thread
--> append user message
--> route_to_appropriate_agent
--> ChatAgent 或 SRELangGraphAgent
--> StateGraph agent node / tool node / conditional edge
+source_documents/**/*.md
+-> stable relative source identity
+-> DocumentProcessor (1000 chars / 200 overlap)
+-> all chunk hashes + all embeddings + dimension validation
+-> one Redis MULTI/EXEC
+   delete old chunks + HSET new chunks + metadata + source tracking
+-> RedisVL VectorRangeQuery / VectorQuery
+-> KnowledgeBaseToolProvider.search
 -> ToolManager
--> always-on TargetDiscoveryToolProvider
--> resolve_redis_targets
--> bind active target
--> RedisCommandToolProvider
--> info / memory_stats / client_list / slowlog
--> ResultEnvelope / ToolMessage evidence
--> AgentResponse
--> assistant message / decision trace
--> CLI JSON output
 ```
 
-## 保留的裁剪
+摄取失败时，embedding 阶段没有 Redis mutation；事务未提交时旧版本保持可检索；
+网络结果未知时相同输入可用确定性 key 重试。检索没有 SCAN、HybridQuery 或 RRF fallback。
 
-- Thread/Task 当前是轻量内存实现，接口形状贴近 original，完整 Redis 持久化后续恢复。
-- router 在配置 key 时使用 `deepseek-v4-flash`，调用失败时使用本地 fallback。
-- `agent/_compat.py` 只保留 fake tool-calling LLM，不模拟 StateGraph 或消息对象。
-- `terminal_synthesis` 的确定性报告只作为 fallback/test helper。
-- knowledge、MCP、support package、worker、scheduler、API、RAG 和 evaluation 是后续插槽。
+## Agent evidence 链
 
-## DeepSeek 运行边界
+- Chat：主图 knowledge ToolMessage 直接转换为顶层 ResultEnvelope。
+- Triage：recommendation worker 将实际 knowledge ToolMessage 转为
+  `RecState.knowledge_envelopes`，worker 完成后立即合并回顶层 `signals_envelopes`。
+- composer 失败不会移除已合并 evidence。
+- `AgentResponse.search_results` 无条件从顶层成功 knowledge envelopes 重新派生；调用方
+  传入的独立 `search_results` 不被信任。
 
-- `core/llm_helpers.py` 沿用 original 的 main/mini/nano 工厂名称。
-- main 使用 `deepseek-v4-pro`；mini/nano 和 main failover 使用 `deepseek-v4-flash`。
-- failover 只重试失败的模型调用，不重启 StateGraph，不主动重放已经完成的工具。
-- 第一版关闭 thinking mode；`reasoning_content` 跨工具轮次回传尚未恢复。
-- 真实 API 测试需要 key 和 `RUN_DEEPSEEK_LIVE_TESTS=1`，默认完整测试不会联网。
+## 当前真实运行边界
 
-## 验证方式
+2026-07-12 本机检查结果：
 
-```powershell
-python -m compileall redis_sre_agent tests
-python -m pytest -q
-redis-sre-agent query "为什么 Redis 慢"
-```
+- 宿主 Redis 可连接，但 `MODULE LIST` 没有 Search，`FT._LIST` 不可用。
+- Docker CLI 已安装，但 Docker service/daemon 未运行；没有本地 Redis Stack/Podman binary。
+- 没有独立 embedding key，chat key 未被复用。
+- 因此真实 `FT.CREATE`/Hash write/VectorQuery 和真实 embedding smoke 本轮没有执行；
+  对应 opt-in integration test 保留为 skip，而不是报告成功。
 
-默认测试使用 fake Redis client、fake LLM 或 fake backend；显式标记的 DeepSeek integration
-测试可以联网，但不得打印 key、请求头或完整模型响应。
+## 有意保留的裁剪
+
+- 不新增 Knowledge Agent，不把 ingest 暴露给 LLM。
+- 不恢复 skills、support tickets、knowledge pack、网页抓取和多索引 pipeline。
+- 不恢复 Hybrid/RRF/reranker、API、worker、scheduler、完整 eval 或 UI。
+- Chat/Triage 主 StateGraph、ToolManager 路由、target binding、Redis diagnostics 与
+  Redis Thread 生命周期保持原结构。

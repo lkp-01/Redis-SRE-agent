@@ -22,6 +22,8 @@ from redis_sre_agent.agent.models import (
     TopicsList,
 )
 from redis_sre_agent.core import llm_helpers
+from redis_sre_agent.core import redis as redis_core
+from redis_sre_agent.core.config import Settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
@@ -109,6 +111,32 @@ class TriagePipelineLLM:
                 }
             ],
         )
+
+
+class KnowledgeTriagePipelineLLM(TriagePipelineLLM):
+    async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        system_text = "\n".join(
+            str(message.content) for message in messages if isinstance(message, SystemMessage)
+        )
+        if "research and then synthesize recommendations" in system_text:
+            if any(isinstance(message, ToolMessage) for message in messages):
+                return AIMessage(content="Knowledge evidence collected", tool_calls=[])
+            knowledge_tool = next(
+                tool
+                for tool in self.tools
+                if tool.name.startswith("knowledge_") and tool.name.endswith("search")
+            )
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "recommendation_knowledge_call",
+                        "name": knowledge_tool.name,
+                        "args": {"query": "redis memory pressure"},
+                    }
+                ],
+            )
+        return await super().ainvoke(messages)
 
 
 class FakeTriageRedisClient:
@@ -294,3 +322,79 @@ async def test_triage_composer_failure_uses_deterministic_fallback(monkeypatch) 
 
     assert llm.stages == ["topics", "recommendation", "composer"]
     assert "Redis 深度诊断报告" in response.response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("composer_error", [False, True])
+async def test_triage_recommendation_knowledge_evidence_reaches_top_level_even_if_composer_fails(
+    monkeypatch,
+    composer_error: bool,
+) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+    import redis_sre_agent.tools.knowledge.knowledge_base as provider_module
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeTriageRedisClient()
+        return self._client
+
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        manager_module,
+        "settings",
+        Settings(
+            _env_file=None,
+            rag_enabled=True,
+            embedding_api_key=SecretStr("TEST_EMBEDDING_KEY"),
+        ),
+    )
+
+    async def ready(_config=None):
+        return redis_core.RAGReadiness("ready", "ready", "RAG 已就绪。")
+
+    async def knowledge_result(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "retrieval_kind": "knowledge_search",
+            "retrieval_label": "Knowledge search",
+            "results": [
+                {
+                    "title": "Memory pressure runbook",
+                    "source": "file://shared/memory-pressure.md",
+                    "document_hash": "doc-triage",
+                    "chunk_index": 1,
+                    "score": 0.08,
+                    "content": "Inspect eviction and maxmemory evidence.",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(redis_core, "get_rag_readiness", ready)
+    monkeypatch.setattr(provider_module, "search_knowledge_base_helper", knowledge_result)
+    llm = KnowledgeTriagePipelineLLM(composer_error=composer_error)
+    agent = SRELangGraphAgent(redis_instance=make_instance(), llm=llm)
+
+    response = await agent.process_query(
+        "triage memory",
+        session_id=f"session-triage-rag-{composer_error}",
+        user_id=None,
+        context={"thread_id": f"thread-triage-rag-{composer_error}"},
+    )
+
+    knowledge_envelopes = [
+        envelope
+        for envelope in response.tool_envelopes
+        if envelope["tool_key"].startswith("knowledge_")
+    ]
+    assert len(knowledge_envelopes) == 1
+    assert knowledge_envelopes[0]["data"]["results"][0]["document_hash"] == "doc-triage"
+    assert response.search_results[0]["title"] == "Memory pressure runbook"
+    assert response.search_results[0]["source"] == "file://shared/memory-pressure.md"
+    assert response.search_results[0]["document_hash"] == "doc-triage"
+    assert response.search_results[0]["chunk_index"] == 1
+    assert response.search_results[0]["score"] == 0.08
+    assert response.search_results[0]["retrieval_kind"] == "knowledge_search"
+    if composer_error:
+        assert "Redis 深度诊断报告" in response.response
+    else:
+        assert response.response.startswith("## Initial Assessment")

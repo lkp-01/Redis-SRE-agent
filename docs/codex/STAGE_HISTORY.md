@@ -1,5 +1,62 @@
 # Stage History
 
+## 2026-07-12 Stage 8 minimum RAG closed loop
+
+### 完成内容
+
+- 增加 RAG `disabled` / `not_ready` / `ready` 三态；ToolManager 只有 ready 才加载
+  `KnowledgeBaseToolProvider`，disabled 完全不检查 RAG。
+- 增加独立 `embedding_api_key` / `embedding_base_url` 配置和最小配置视图；默认
+  vectorizer 不读取或回退到 DeepSeek chat key/base URL。
+- 使用 RedisVL original schema 恢复 `sre_knowledge`，保留 `product_labels`、
+  `product_label_tags` 和 float32/cosine/flat vector 字段。
+- `get_knowledge_index()` 只构造；显式 `ensure_knowledge_index(..., true)` 才创建。
+- 恢复本地 Markdown chunk、stable source identity、ArtifactStorage、batch manifest、
+  direct/prepared ingestion 和 `pipeline` CLI；没有 skills/网页/多索引隐藏依赖。
+- 摄取先完成全部 embedding/维度校验，再用一个 `MULTI/EXEC` 原子替换 chunks、
+  document metadata 和 source tracking；fake 测试覆盖保旧与确定性重试。
+- 恢复纯向量 `search_knowledge_base_helper()`、唯一 READ knowledge provider 和
+  `knowledge search` CLI；没有 SCAN vector fallback、HybridQuery 或 RRF。
+- Recommendation worker 新增 `knowledge_envelopes`，按 ToolMessage call id/name/args
+  生成 ResultEnvelope，并在 composer 前合并到顶层 `signals_envelopes`。
+- `AgentResponse.search_results` 现在只信任顶层成功 knowledge envelopes；失败、
+  unavailable 或无 source 的结果不会成为 citation。
+
+### 从 original 复制或适配
+
+- `core/vectorizer_helpers.py`：`Vectorizer`、`VectorizerFactory`、factory 注册和异步 API
+  校验；安全适配为独立 embedding 配置。
+- `core/redis.py`：`_build_document_schema()`、knowledge index/schema 字段和 RedisVL
+  `AsyncSearchIndex` 构造形状；创建职责拆到显式 ensure。
+- `pipelines/scraper/base.py`：文档枚举、`ScrapedDocument`、`ArtifactStorage` 和 manifest。
+- `pipelines/ingestion/*`：`DocumentProcessor`、source helper、deduplicator、processor 和
+  workflow 文件边界；原版先删后写改为单事务替换。
+- `core/knowledge_helpers.py`、`tools/knowledge/knowledge_base.py`、`cli/knowledge.py`：
+  只保留纯向量 search 所需最小部分。
+- `agent/subgraphs/recommendation_worker.py` 与 `agent/langgraph_agent.py`：保留原短工具
+  循环和 topic map/reduce，仅增加内部 evidence 回传接缝。
+
+### 验证结果
+
+- R0 focused：30 passed；CLI 回归 6 passed。
+- R1a focused：13 passed；R1b + pipeline regression：23 passed。
+- R2 focused/RAG regression：18 passed / 54 passed。
+- R3 focused：31 passed；Agent/CLI regression：46 passed。
+- 全量：148 passed，3 skipped，1 个既有 Click `MultiCommand` deprecation warning。
+- 3 个 skip：2 个显式 DeepSeek live tests，1 个显式 Redis Stack RAG integration。
+- 宿主 Redis 真实检查：可连接但没有 Search/Vector module。
+- Docker service stopped，且没有本地 Redis Stack/Podman binary；因此未执行真实
+  FT.CREATE/write/VectorQuery，不把 skip 描述为验证成功。
+- 没有独立 embedding key；没有执行真实 embedding smoke，也没有复用 chat key。
+
+### 已知差异与下一步
+
+- 下一步从隔离 Redis Stack 环境运行 `test_rag_redis_stack.py`，再使用独立 embedding
+  key 做显式 smoke，验证真实 provider 返回维度与 schema 一致。
+- RedisVL 当前解析版本为安装时满足 `<1.0` 的版本；后续部署应锁定并验证目标版本。
+- Hybrid/full-text/reranking、skills/tickets、knowledge management、API/worker/eval/UI
+  继续保留插槽。
+
 ## 2026-07-12 Live smoke compatibility fixes
 
 ### 完成内容

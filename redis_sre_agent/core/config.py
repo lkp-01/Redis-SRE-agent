@@ -198,9 +198,21 @@ class Settings(BaseSettings):
         description="DeepSeek thinking 开关；首期默认关闭以稳定支持工具循环。",
     )
 
+    rag_enabled: bool = Field(
+        default=False,
+        description="是否启用可选 RAG 闭环；关闭时不会检查向量依赖或 knowledge index。",
+    )
+    embedding_api_key: Optional[SecretStr] = Field(
+        default=None,
+        description="embedding provider 的独立 API key，不与 Agent chat key 共用。",
+    )
+    embedding_base_url: Optional[str] = Field(
+        default=None,
+        description="embedding provider 的独立服务地址。",
+    )
     embedding_provider: str = Field(default="openai", description="向量化 provider 插槽。")
     embedding_model: str = Field(default="text-embedding-3-small", description="向量模型插槽。")
-    vector_dim: int = Field(default=1536, description="向量维度插槽。")
+    vector_dim: int = Field(default=1536, gt=0, description="向量维度插槽。")
     embeddings_cache_ttl: Optional[int] = Field(default=86400 * 7, description="向量缓存 TTL。")
     vectorizer_factory: Optional[str] = Field(default=None, description="自定义向量器工厂插槽。")
 

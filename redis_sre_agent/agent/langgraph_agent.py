@@ -32,6 +32,7 @@ from .helpers import (
     coerce_response_text,
     extract_last_ai_response,
     guarded_ainvoke,
+    merge_result_envelopes,
     resolve_graph_thread_id,
 )
 from .models import AgentResponse, TopicsList
@@ -506,6 +507,9 @@ class SRELangGraphAgent:
                 from .subgraphs.recommendation_worker import build_recommendation_worker
 
                 knowledge_definitions = tool_mgr.get_tools_for_capability(ToolCapability.KNOWLEDGE)
+                knowledge_definitions_by_name = {
+                    definition.name: definition for definition in knowledge_definitions
+                }
                 knowledge_adapters = await build_adapters_for_tooldefs(
                     tool_mgr,
                     knowledge_definitions,
@@ -523,6 +527,7 @@ class SRELangGraphAgent:
                 worker = build_recommendation_worker(
                     self.mini_llm,
                     adapters,
+                    knowledge_tooldefs_by_name=knowledge_definitions_by_name,
                     max_tool_steps=max_tool_steps,
                 )
                 envelopes_by_key = {
@@ -559,11 +564,24 @@ class SRELangGraphAgent:
                                     "topic": topic,
                                     "evidence": evidence,
                                     "instance": instance_ctx,
+                                    "knowledge_envelopes": [],
                                 }
                             )
                         )
                     )
                 recommendation_states = await asyncio.gather(*tasks)
+                worker_knowledge_envelopes = [
+                    envelope
+                    for worker_state in recommendation_states
+                    if worker_state
+                    for envelope in worker_state.get("knowledge_envelopes") or []
+                ]
+                # 在 composer 之前立刻合并。后续编辑失败进入 deterministic fallback 时，
+                # 已经实际执行过的 knowledge evidence 仍留在顶层状态。
+                envelopes = merge_result_envelopes(
+                    envelopes,
+                    worker_knowledge_envelopes,
+                )
                 recommendations = [
                     state_result["result"]
                     for state_result in recommendation_states

@@ -16,7 +16,10 @@ from redis_sre_agent.core.config import DEFAULT_CONFIG_PATHS, MCPServerConfig, S
 
 
 def test_settings_can_be_created_without_real_external_secrets() -> None:
-    settings = Settings(_env_file=None)
+    # config 模块会按 original 形状加载本机 .env；本测试显式隔离环境，不能依赖开发者
+    # 是否已经配置 chat/embedding key。
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(_env_file=None)
 
     assert settings.app_name == "Redis SRE Agent"
     assert settings.debug is False
@@ -29,16 +32,24 @@ def test_settings_can_be_created_without_real_external_secrets() -> None:
     assert settings.llm_timeout == 180.0
     assert settings.llm_failover_enabled is True
     assert settings.deepseek_thinking_mode == "disabled"
+    assert settings.rag_enabled is False
+    assert settings.embedding_api_key is None
+    assert settings.embedding_base_url is None
+    assert settings.embedding_provider == "openai"
+    assert settings.embedding_model == "text-embedding-3-small"
+    assert settings.vector_dim == 1536
 
 
 def test_secretstr_does_not_leak_in_repr() -> None:
     settings = Settings(
         _env_file=None,
         redis_url=SecretStr("FAKE_TEST_REDIS_CONNECTION_REF"),
+        embedding_api_key=SecretStr("FAKE_TEST_EMBEDDING_KEY"),
     )
 
     rendered = repr(settings)
     assert "FAKE_TEST_REDIS_CONNECTION_REF" not in rendered
+    assert "FAKE_TEST_EMBEDDING_KEY" not in rendered
     assert "SecretStr" in rendered
 
 
@@ -54,6 +65,9 @@ def test_environment_overrides_defaults() -> None:
         "OPENAI_MODEL_MINI": "fallback-test-model",
         "LLM_FAILOVER_ENABLED": "false",
         "DEEPSEEK_THINKING_MODE": "enabled",
+        "RAG_ENABLED": "true",
+        "EMBEDDING_API_KEY": "SEPARATE_EMBEDDING_KEY",
+        "EMBEDDING_BASE_URL": "https://embedding.example.invalid/v1",
     }
     with patch.dict(os.environ, env, clear=True):
         settings = Settings(_env_file=None)
@@ -68,6 +82,10 @@ def test_environment_overrides_defaults() -> None:
     assert settings.openai_model_mini == "fallback-test-model"
     assert settings.llm_failover_enabled is False
     assert settings.deepseek_thinking_mode == "enabled"
+    assert settings.rag_enabled is True
+    assert settings.embedding_api_key is not None
+    assert settings.embedding_api_key.get_secret_value() == "SEPARATE_EMBEDDING_KEY"
+    assert settings.embedding_base_url == "https://embedding.example.invalid/v1"
 
 
 def test_yaml_config_file_loads_and_env_wins(tmp_path: Path) -> None:

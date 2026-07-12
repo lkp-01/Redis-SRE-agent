@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from ..helpers import guarded_ainvoke
+from ..helpers import build_result_envelope, guarded_ainvoke
 from ..models import Recommendation
 
 
@@ -19,17 +19,20 @@ class RecState(TypedDict, total=False):
     evidence: List[Dict[str, Any]]
     instance: Dict[str, Any]
     result: Dict[str, Any]
+    knowledge_envelopes: List[Dict[str, Any]]
 
 
 def build_recommendation_worker(
     base_llm: Any,
     knowledge_tool_adapters: List[Any],
     *,
+    knowledge_tooldefs_by_name: Optional[Dict[str, Any]] = None,
     max_tool_steps: int = 3,
 ) -> Any:
     """保留 original 的短工具循环，再用 structured output 生成 Recommendation。"""
 
     adapters = list(knowledge_tool_adapters or [])
+    knowledge_definitions = dict(knowledge_tooldefs_by_name or {})
     tool_node = ToolNode(adapters)
     llm_with_tools = base_llm.bind_tools(adapters) if adapters else base_llm
 
@@ -53,14 +56,45 @@ def build_recommendation_worker(
 
     async def tools_node(state: RecState) -> RecState:
         previous = list(state.get("messages") or [])
+        last_ai: Optional[AIMessage] = next(
+            (message for message in reversed(previous) if isinstance(message, AIMessage)),
+            None,
+        )
+        tool_calls = list(last_ai.tool_calls or []) if last_ai else []
         output = await tool_node.ainvoke({"messages": previous})
         tool_messages = [
             message for message in output.get("messages", []) if isinstance(message, ToolMessage)
         ]
+        calls_by_id = {
+            str(call.get("id") or call.get("tool_call_id") or ""): call
+            for call in tool_calls
+        }
+        knowledge_envelopes = list(state.get("knowledge_envelopes") or [])
+        for index, tool_message in enumerate(tool_messages):
+            call_id = str(getattr(tool_message, "tool_call_id", "") or "")
+            call = calls_by_id.get(call_id)
+            if call is None and index < len(tool_calls):
+                call = tool_calls[index]
+            call = call or {}
+            tool_name = str(
+                call.get("name") or getattr(tool_message, "name", "") or ""
+            )
+            if tool_name not in knowledge_definitions:
+                continue
+            tool_args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            knowledge_envelopes.append(
+                build_result_envelope(
+                    tool_name,
+                    tool_args,
+                    tool_message,
+                    knowledge_definitions,
+                )
+            )
         return {
             **state,
             "messages": previous + tool_messages,
             "budget": max(0, int(state.get("budget", max_tool_steps)) - 1),
+            "knowledge_envelopes": knowledge_envelopes,
         }
 
     def should_continue(state: RecState) -> str:
@@ -85,6 +119,7 @@ def build_recommendation_worker(
         )
         topic = state.get("topic") or {}
         evidence = state.get("evidence") or []
+        knowledge_evidence = state.get("knowledge_envelopes") or []
         instance = state.get("instance") or {}
         system = SystemMessage(
             content=(
@@ -99,7 +134,8 @@ def build_recommendation_worker(
                 f"Topic (JSON):\n{topic}\n\n"
                 f"Instance Facts (JSON):\n{instance}\n\n"
                 "Evidence is a verbatim or summarized record of upstream tool calls.\n"
-                f"Evidence (JSON):\n{evidence}"
+                f"Evidence (JSON):\n{evidence}\n\n"
+                f"Knowledge Evidence (ResultEnvelope JSON):\n{knowledge_evidence}"
             )
         )
         recommendation = await guarded_ainvoke(

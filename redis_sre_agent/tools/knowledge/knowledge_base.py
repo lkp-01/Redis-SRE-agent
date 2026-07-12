@@ -1,19 +1,20 @@
-"""Stage 5 dummy knowledge provider。
-
-原项目的 KnowledgeBaseToolProvider 暴露多个 RAG、skill 和 support ticket 工具。当前阶段
-只保留 `search` 的同名入口，返回空结果，避免提前实现 Stage 8 的知识库流水线。
-"""
+"""只读 knowledge search ToolProvider。"""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from redis_sre_agent.core.knowledge_helpers import (
+    _coerce_non_negative_int,
+    _coerce_positive_int,
+    search_knowledge_base_helper,
+)
 from redis_sre_agent.tools.models import ToolCapability, ToolDefinition
 from redis_sre_agent.tools.protocols import ToolProvider
 
 
 class KnowledgeBaseToolProvider(ToolProvider):
-    """只提供 dummy search 的 knowledge provider。"""
+    """只向 LLM 暴露一个 READ search；摄取只能从显式 pipeline 入口进行。"""
 
     @property
     def provider_name(self) -> str:
@@ -28,9 +29,8 @@ class KnowledgeBaseToolProvider(ToolProvider):
             ToolDefinition(
                 name=self._make_tool_name("search"),
                 description=(
-                    "Search the Redis SRE knowledge base. In this Stage 5 reproduction this "
-                    "is a dummy RAG slot and returns no documents; real ingestion, embedding, "
-                    "and vector retrieval are future-stage work."
+                    "搜索 Redis SRE knowledge base 中的 runbook、诊断说明和操作文档。"
+                    "使用结果时必须保留 title 与 source 引用。"
                 ),
                 capability=ToolCapability.KNOWLEDGE,
                 parameters={
@@ -38,29 +38,26 @@ class KnowledgeBaseToolProvider(ToolProvider):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query describing the needed Redis knowledge.",
+                            "description": "要查找的 Redis 诊断知识。",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of results to return.",
                             "default": 10,
                             "minimum": 1,
                             "maximum": 50,
                         },
                         "offset": {
                             "type": "integer",
-                            "description": "Number of results to skip.",
                             "default": 0,
                             "minimum": 0,
                         },
                         "version": {
                             "type": "string",
-                            "description": "Documentation version filter placeholder.",
                             "default": "latest",
                         },
                         "distance_threshold": {
                             "type": "number",
-                            "description": "Semantic distance threshold placeholder.",
+                            "description": "可选 cosine distance 上限；null 表示纯 KNN。",
                         },
                     },
                     "required": ["query"],
@@ -76,16 +73,10 @@ class KnowledgeBaseToolProvider(ToolProvider):
         version: Optional[str] = "latest",
         distance_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """返回空知识结果，明确告诉上层真实 RAG 尚未启用。"""
-        return {
-            "status": "success",
-            "query": query,
-            "limit": limit,
-            "offset": offset,
-            "version": version,
-            "distance_threshold": distance_threshold,
-            "retrieval_kind": "dummy_knowledge",
-            "retrieval_label": "Dummy knowledge slot",
-            "results": [],
-            "message": "Stage 5 仅保留知识库工具插槽，真实 RAG 检索尚未启用。",
-        }
+        return await search_knowledge_base_helper(
+            query=query,
+            limit=min(_coerce_positive_int(limit, default=10), 50),
+            offset=_coerce_non_negative_int(offset, default=0),
+            version=version,
+            distance_threshold=distance_threshold,
+        )

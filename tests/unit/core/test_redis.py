@@ -13,6 +13,7 @@ from redis_sre_agent.core.redis import (
     LightweightSearchIndex,
     SRE_CLUSTERS_SCHEMA,
     SRE_INSTANCES_SCHEMA,
+    SRE_KNOWLEDGE_SCHEMA,
     SRE_THREADS_SCHEMA,
     get_clusters_index,
     get_instances_index,
@@ -31,6 +32,43 @@ def test_instance_and_cluster_schemas_are_present() -> None:
     assert {"name", "environment", "status"}.issubset(
         {field["name"] for field in SRE_INSTANCES_SCHEMA["fields"]}
     )
+
+
+def test_knowledge_schema_preserves_original_fields_and_vector_contract() -> None:
+    fields = {field["name"]: field for field in SRE_KNOWLEDGE_SCHEMA["fields"]}
+
+    assert SRE_KNOWLEDGE_SCHEMA["index"] == {
+        "name": "sre_knowledge",
+        "prefix": "sre_knowledge:",
+        "storage_type": "hash",
+    }
+    assert {
+        "id",
+        "document_hash",
+        "content_hash",
+        "title",
+        "content",
+        "source",
+        "category",
+        "doc_type",
+        "name",
+        "summary",
+        "priority",
+        "pinned",
+        "severity",
+        "product_labels",
+        "product_label_tags",
+        "version",
+        "chunk_index",
+        "created_at",
+        "vector",
+    }.issubset(fields)
+    assert fields["vector"]["attrs"] == {
+        "dims": 1536,
+        "distance_metric": "cosine",
+        "algorithm": "flat",
+        "datatype": "float32",
+    }
 
 
 @patch("redis_sre_agent.core.redis.Redis")

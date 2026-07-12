@@ -52,8 +52,10 @@ class ToolManager:
     _provider_class_cache: Dict[str, type] = {}
     _always_on_providers = [
         "redis_sre_agent.tools.target_discovery.provider.TargetDiscoveryToolProvider",
-        "redis_sre_agent.tools.knowledge.knowledge_base.KnowledgeBaseToolProvider",
     ]
+    _knowledge_provider = (
+        "redis_sre_agent.tools.knowledge.knowledge_base.KnowledgeBaseToolProvider"
+    )
 
     def __init__(
         self,
@@ -92,6 +94,13 @@ class ToolManager:
         self._attached_target_bindings: Dict[str, Any] = {}
         self._toolset_generation = 0
         self._shared_cache = None
+        from redis_sre_agent.core.redis import RAGReadiness
+
+        self.rag_readiness = RAGReadiness(
+            state="disabled",
+            reason_code="disabled",
+            message="RAG 未启用。",
+        )
         if cache_client is not None and redis_instance is not None:
             from redis_sre_agent.tools.cache import ToolCache
 
@@ -113,6 +122,20 @@ class ToolManager:
         for provider_path in self._always_on_providers:
             # 异步加载这些常驻 Provider，并标记 always_on=True，表示它们不依赖特定目标
             await self._load_provider(provider_path, always_on=True)
+
+        # knowledge provider 不再常驻。关闭时完全不做 readiness/Redis/embedding 检查；
+        # 开启后也只有 ready 才把 search 工具暴露给 LLM。
+        if settings.rag_enabled:
+            from redis_sre_agent.core.redis import get_rag_readiness
+
+            self.rag_readiness = await get_rag_readiness(settings)
+            if self.rag_readiness.ready:
+                await self._load_provider(self._knowledge_provider, always_on=True)
+            else:
+                logger.warning(
+                    "RAG knowledge provider 未加载：%s",
+                    self.rag_readiness.reason_code,
+                )
 
         # 触发 MCP (Model Context Protocol) 相关的 Provider 加载（当前为预留的插槽方法）
         await self._load_mcp_providers()

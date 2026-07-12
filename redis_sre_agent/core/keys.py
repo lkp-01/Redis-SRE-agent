@@ -86,8 +86,26 @@ class RedisKeys:
         return f"sre_knowledge:{document_hash}:chunk:{chunk_index}"
 
     @staticmethod
+    def knowledge_chunk_pattern(document_hash: str) -> str:
+        """一个知识文档全部分块的匹配模式。"""
+
+        return f"sre_knowledge:{document_hash}:chunk:*"
+
+    @staticmethod
     def knowledge_documents() -> str:
         return "sre_knowledge:documents"
+
+    @staticmethod
+    def knowledge_document_meta(document_hash: str) -> str:
+        """按内容 hash 记录文档级元数据。"""
+
+        return f"sre_knowledge_meta:{document_hash}"
+
+    @staticmethod
+    def knowledge_source_meta(path_hash: str) -> str:
+        """按稳定来源路径 hash 记录当前文档版本。"""
+
+        return f"sre_knowledge_meta:source:{path_hash}"
 
     @staticmethod
     def schedule_key(schedule_id: str) -> str:

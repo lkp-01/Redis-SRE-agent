@@ -27,12 +27,21 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from redis.asyncio import Redis
+from redisvl.index import AsyncSearchIndex
+from redisvl.schema import IndexSchema
+from redisvl.utils.vectorize import OpenAITextVectorizer as OpenAITextVectorizer
 
 from redis_sre_agent.core.config import Settings, settings
 from redis_sre_agent.core.redisearch import CountQuery, FilterQuery
+from redis_sre_agent.core.vectorizer_helpers import (
+    Vectorizer,
+    create_vectorizer,
+    validate_embedding_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,66 @@ SRE_TASKS_INDEX = "sre_tasks"
 SRE_INSTANCES_INDEX = "sre_instances"
 SRE_CLUSTERS_INDEX = "sre_clusters"
 SRE_TARGETS_INDEX = "sre_targets"
+
+
+def _build_document_schema(
+    index_name: str,
+    include_pinned: bool,
+    *,
+    vector_dim: Optional[int] = None,
+) -> dict[str, Any]:
+    """按 original 字段和 RedisVL 形状构造单一 knowledge hash 索引。"""
+
+    fields: list[dict[str, Any]] = [
+        {"name": "id", "type": "tag"},
+        {"name": "title", "type": "text"},
+        {"name": "content", "type": "text"},
+        {"name": "content_hash", "type": "tag"},
+        {"name": "document_hash", "type": "tag"},
+        {"name": "source", "type": "tag"},
+        {"name": "category", "type": "tag"},
+        {"name": "doc_type", "type": "tag"},
+        {"name": "name", "type": "tag"},
+        {"name": "summary", "type": "text"},
+        {"name": "priority", "type": "tag"},
+        {"name": "severity", "type": "tag"},
+        {"name": "product_labels", "type": "tag"},
+        {"name": "product_label_tags", "type": "tag"},
+        {"name": "version", "type": "tag"},
+        {"name": "chunk_index", "type": "numeric"},
+        {"name": "created_at", "type": "numeric"},
+        {
+            "name": "vector",
+            "type": "vector",
+            "attrs": {
+                "dims": int(vector_dim if vector_dim is not None else settings.vector_dim),
+                "distance_metric": "cosine",
+                "algorithm": "flat",
+                "datatype": "float32",
+            },
+        },
+    ]
+    if include_pinned:
+        chunk_position = next(
+            (i for i, field in enumerate(fields) if field["name"] == "chunk_index"),
+            len(fields),
+        )
+        fields.insert(chunk_position, {"name": "pinned", "type": "tag"})
+    return {
+        "index": {
+            "name": index_name,
+            "prefix": f"{index_name}:",
+            "storage_type": "hash",
+        },
+        "fields": fields,
+    }
+
+
+SRE_KNOWLEDGE_SCHEMA = _build_document_schema(
+    SRE_KNOWLEDGE_INDEX,
+    include_pinned=True,
+    vector_dim=settings.vector_dim,
+)
 
 SRE_INSTANCES_SCHEMA = {
     "index": {
@@ -233,6 +302,300 @@ def get_redis_client(url: Optional[str] = None, config: Optional[Settings] = Non
     cfg = config or settings
     redis_url = url or cfg.redis_url.get_secret_value()
     return Redis.from_url(redis_url, decode_responses=False)
+
+
+@dataclass(frozen=True)
+class RAGReadiness:
+    """可安全展示的 RAG 三态结果；message 中不放底层连接异常。"""
+
+    state: str
+    reason_code: str
+    message: str
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "reason_code": self.reason_code,
+            "message": self.message,
+            "ready": self.ready,
+        }
+
+
+class RAGNotReadyError(RuntimeError):
+    """显式管理入口和检索入口共享的安全错误。"""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+_RAG_MESSAGES = {
+    "disabled": "RAG 未启用。",
+    "embedding_config_invalid": "embedding 配置无效或不完整。",
+    "redis_search_unavailable": "Redis Search/Vector 能力不可用。",
+    "index_missing": "knowledge index 尚未创建；请通过显式摄取或索引管理入口创建。",
+    "schema_mismatch": "knowledge index schema 与当前 embedding 维度或字段契约不一致。",
+    "ready": "RAG 已就绪。",
+}
+
+
+def _decode_redis_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (list, tuple)):
+        return [_decode_redis_value(item) for item in value]
+    return value
+
+
+def _pairs_to_dict(values: list[Any]) -> dict[str, Any]:
+    normalized = _decode_redis_value(values)
+    return {
+        str(normalized[index]): normalized[index + 1]
+        for index in range(0, len(normalized) - 1, 2)
+    }
+
+
+def _expected_field_definitions(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    definitions: dict[str, dict[str, Any]] = {}
+    for field in schema.get("fields", []):
+        name = str(field.get("name") or "").strip()
+        if not name:
+            continue
+        field_type = str(field.get("type") or "").upper()
+        definition: dict[str, Any] = {"type": field_type}
+        if field_type == "VECTOR":
+            attrs = field.get("attrs") or {}
+            definition["attrs"] = {
+                "algorithm": str(attrs.get("algorithm") or "").upper(),
+                "data_type": str(attrs.get("datatype") or "").upper(),
+                "dim": int(attrs.get("dims")),
+                "distance_metric": str(attrs.get("distance_metric") or "").upper(),
+            }
+        definitions[name] = definition
+    return definitions
+
+
+def _actual_field_definitions(raw_info: Any) -> dict[str, dict[str, Any]]:
+    if isinstance(raw_info, dict):
+        info = {
+            str(_decode_redis_value(key)): _decode_redis_value(value)
+            for key, value in raw_info.items()
+        }
+    else:
+        info = _pairs_to_dict(list(raw_info or []))
+    definitions: dict[str, dict[str, Any]] = {}
+    for raw_attribute in info.get("attributes") or []:
+        if isinstance(raw_attribute, dict):
+            attribute = {
+                str(_decode_redis_value(key)): _decode_redis_value(value)
+                for key, value in raw_attribute.items()
+            }
+        else:
+            attribute = _pairs_to_dict(list(raw_attribute or []))
+        name = str(attribute.get("attribute") or attribute.get("identifier") or "").strip()
+        if not name:
+            continue
+        field_type = str(attribute.get("type") or "").upper()
+        definition: dict[str, Any] = {"type": field_type}
+        if field_type == "VECTOR":
+            try:
+                dim: Any = int(attribute.get("dim"))
+            except (TypeError, ValueError):
+                dim = attribute.get("dim")
+            definition["attrs"] = {
+                "algorithm": str(attribute.get("algorithm") or "").upper(),
+                "data_type": str(attribute.get("data_type") or "").upper(),
+                "dim": dim,
+                "distance_metric": str(attribute.get("distance_metric") or "").upper(),
+            }
+        definitions[name] = definition
+    return definitions
+
+
+def _knowledge_schema_matches(expected: dict[str, Any], raw_info: Any) -> bool:
+    expected_fields = _expected_field_definitions(expected)
+    actual_fields = _actual_field_definitions(raw_info)
+    return expected_fields == actual_fields
+
+
+def _get_index_client(index: Any) -> Any:
+    client = getattr(index, "_redis_client", None) or getattr(index, "client", None)
+    if client is None:
+        raise RuntimeError("knowledge index 没有可用 Redis client。")
+    return client
+
+
+async def _close_index_client(index: Any) -> None:
+    try:
+        client = _get_index_client(index)
+    except Exception:
+        return
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:
+        logger.debug("关闭 knowledge readiness client 失败。", exc_info=True)
+
+
+def _command_info_has_all(command_info: Any, expected_count: int) -> bool:
+    if isinstance(command_info, dict):
+        values = list(command_info.values())
+        return len(values) >= expected_count and all(value for value in values[:expected_count])
+    if isinstance(command_info, (list, tuple)):
+        return len(command_info) >= expected_count and all(
+            value is not None and value is not False for value in command_info[:expected_count]
+        )
+    return False
+
+
+async def _redis_search_available(client: Any) -> bool:
+    try:
+        command_info = await client.execute_command(
+            "COMMAND",
+            "INFO",
+            "FT.SEARCH",
+            "FT.CREATE",
+        )
+    except Exception:
+        return False
+    return _command_info_has_all(command_info, 2)
+
+
+def get_vectorizer(config: Optional[Settings] = None) -> Vectorizer:
+    """返回只使用 embedding 配置的向量器。"""
+
+    return create_vectorizer(config=config)
+
+
+async def get_knowledge_index(config: Optional[Settings] = None) -> AsyncSearchIndex:
+    """只构造 knowledge index；这里绝不执行 FT.CREATE。"""
+
+    cfg = config or settings
+    schema_dict = _build_document_schema(
+        SRE_KNOWLEDGE_INDEX,
+        include_pinned=True,
+        vector_dim=cfg.vector_dim,
+    )
+    client = get_redis_client(config=cfg)
+    return AsyncSearchIndex(
+        schema=IndexSchema.from_dict(schema_dict),
+        redis_client=client,
+    )
+
+
+async def ensure_knowledge_index(
+    config: Optional[Settings] = None,
+    create_if_missing: bool = False,
+) -> AsyncSearchIndex:
+    """检查 knowledge index；只有显式参数为真时才允许创建。"""
+
+    cfg = config or settings
+    if not cfg.rag_enabled:
+        raise RAGNotReadyError("disabled", _RAG_MESSAGES["disabled"])
+    try:
+        validate_embedding_config(cfg)
+    except Exception as exc:
+        raise RAGNotReadyError(
+            "embedding_config_invalid",
+            _RAG_MESSAGES["embedding_config_invalid"],
+        ) from exc
+
+    index: Any = None
+    try:
+        index = await get_knowledge_index(cfg)
+        client = _get_index_client(index)
+        if not await _redis_search_available(client):
+            raise RAGNotReadyError(
+                "redis_search_unavailable",
+                _RAG_MESSAGES["redis_search_unavailable"],
+            )
+
+        exists = bool(await index.exists())
+        if not exists:
+            if not create_if_missing:
+                raise RAGNotReadyError("index_missing", _RAG_MESSAGES["index_missing"])
+            try:
+                await index.create()
+            except Exception as exc:
+                raise RAGNotReadyError(
+                    "redis_search_unavailable",
+                    _RAG_MESSAGES["redis_search_unavailable"],
+                ) from exc
+            if not await index.exists():
+                raise RAGNotReadyError("index_missing", _RAG_MESSAGES["index_missing"])
+
+        expected_schema = _build_document_schema(
+            SRE_KNOWLEDGE_INDEX,
+            include_pinned=True,
+            vector_dim=cfg.vector_dim,
+        )
+        try:
+            raw_info = await client.execute_command("FT.INFO", SRE_KNOWLEDGE_INDEX)
+        except Exception as exc:
+            raise RAGNotReadyError(
+                "redis_search_unavailable",
+                _RAG_MESSAGES["redis_search_unavailable"],
+            ) from exc
+        if not _knowledge_schema_matches(expected_schema, raw_info):
+            raise RAGNotReadyError("schema_mismatch", _RAG_MESSAGES["schema_mismatch"])
+
+        try:
+            await client.execute_command(
+                "FT.SEARCH",
+                SRE_KNOWLEDGE_INDEX,
+                "*",
+                "LIMIT",
+                0,
+                0,
+            )
+        except Exception as exc:
+            raise RAGNotReadyError(
+                "redis_search_unavailable",
+                _RAG_MESSAGES["redis_search_unavailable"],
+            ) from exc
+        return index
+    except RAGNotReadyError:
+        if index is not None:
+            await _close_index_client(index)
+        raise
+    except Exception as exc:
+        if index is not None:
+            await _close_index_client(index)
+        raise RAGNotReadyError(
+            "redis_search_unavailable",
+            _RAG_MESSAGES["redis_search_unavailable"],
+        ) from exc
+
+
+async def get_rag_readiness(config: Optional[Settings] = None) -> RAGReadiness:
+    """普通读取路径使用的三态检查；不会创建或修改索引。"""
+
+    cfg = config or settings
+    if not cfg.rag_enabled:
+        return RAGReadiness("disabled", "disabled", _RAG_MESSAGES["disabled"])
+    try:
+        validate_embedding_config(cfg)
+    except Exception:
+        return RAGReadiness(
+            "not_ready",
+            "embedding_config_invalid",
+            _RAG_MESSAGES["embedding_config_invalid"],
+        )
+
+    try:
+        index = await ensure_knowledge_index(cfg, create_if_missing=False)
+    except RAGNotReadyError as exc:
+        return RAGReadiness("not_ready", exc.reason_code, str(exc))
+    await _close_index_client(index)
+    return RAGReadiness("ready", "ready", _RAG_MESSAGES["ready"])
 
 # 创建“Redis 实例索引”的轻量对象/实例，作为搜索入口提供给外界调用；
 # 可通过其封装好的方法，操作底层 Redis 数据库中的真实索引，从而检索/管理各类 Redis 实例（服务器节点）的元数据。

@@ -367,8 +367,21 @@ def extract_citations(envelopes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         name = str(envelope.get("name", ""))
         if "knowledge" not in tool_key.lower():
             continue
+        if str(envelope.get("status") or "success").lower() in {
+            "error",
+            "failed",
+            "failure",
+        }:
+            continue
         data = envelope.get("data") or {}
         if not isinstance(data, dict):
+            continue
+        if str(data.get("status") or "success").lower() in {
+            "error",
+            "failed",
+            "failure",
+            "unavailable",
+        }:
             continue
         results = data.get("results") or []
         if not isinstance(results, list):
@@ -382,9 +395,42 @@ def extract_citations(envelopes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if not isinstance(result, dict):
                 continue
             citation = dict(result)
+            if not str(citation.get("source") or "").strip():
+                continue
             if default_retrieval_kind:
                 citation.setdefault("retrieval_kind", default_retrieval_kind)
             if default_retrieval_label:
                 citation.setdefault("retrieval_label", default_retrieval_label)
             citations.append(citation)
     return citations
+
+
+def merge_result_envelopes(
+    current: List[Dict[str, Any]],
+    additions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """保持执行顺序合并 envelope，并避免同一 worker 状态被重复收集。"""
+
+    merged = [dict(item) for item in current or []]
+    seen: set[str] = set()
+    for item in merged:
+        try:
+            seen.add(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
+        except Exception:
+            seen.add(repr(item))
+    for item in additions or []:
+        normalized = dict(item)
+        try:
+            fingerprint = json.dumps(
+                normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            fingerprint = repr(normalized)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        merged.append(normalized)
+    return merged

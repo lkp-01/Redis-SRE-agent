@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 from pydantic import SecretStr
 
+from redis_sre_agent.core import redis as redis_core
+from redis_sre_agent.core.config import Settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
@@ -54,6 +56,84 @@ async def test_tool_manager_loads_target_discovery_and_redis_info_tool(monkeypat
     assert result["status"] == "success"
     assert result["section"] == "all"
     assert result["data"]["redis_version"] == "stage4-fake"
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_disabled_rag_never_checks_or_loads_knowledge(monkeypatch) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module,
+        "settings",
+        Settings(_env_file=None, rag_enabled=False),
+    )
+
+    async def forbidden_readiness(*_args, **_kwargs):
+        raise AssertionError("disabled RAG must not perform readiness checks")
+
+    monkeypatch.setattr(redis_core, "get_rag_readiness", forbidden_readiness)
+
+    async with ToolManager() as manager:
+        names = [tool.name for tool in manager.get_tools_for_llm()]
+        readiness = manager.rag_readiness
+
+    assert any(name.endswith("resolve_redis_targets") for name in names)
+    assert not any(name.startswith("knowledge_") for name in names)
+    assert readiness.state == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_enabled_not_ready_hides_knowledge_tool(monkeypatch) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+
+    config = Settings(
+        _env_file=None,
+        rag_enabled=True,
+        embedding_api_key=SecretStr("TEST_EMBEDDING_KEY"),
+    )
+    monkeypatch.setattr(manager_module, "settings", config)
+
+    async def fake_readiness(_config=None):
+        return redis_core.RAGReadiness(
+            state="not_ready",
+            reason_code="index_missing",
+            message="knowledge index is missing",
+        )
+
+    monkeypatch.setattr(redis_core, "get_rag_readiness", fake_readiness)
+
+    async with ToolManager() as manager:
+        names = [tool.name for tool in manager.get_tools_for_llm()]
+        readiness = manager.rag_readiness
+
+    assert not any(name.startswith("knowledge_") for name in names)
+    assert readiness.reason_code == "index_missing"
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_loads_knowledge_only_when_ready(monkeypatch) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+
+    config = Settings(
+        _env_file=None,
+        rag_enabled=True,
+        embedding_api_key=SecretStr("TEST_EMBEDDING_KEY"),
+    )
+    monkeypatch.setattr(manager_module, "settings", config)
+
+    async def fake_readiness(_config=None):
+        return redis_core.RAGReadiness(
+            state="ready",
+            reason_code="ready",
+            message="RAG is ready",
+        )
+
+    monkeypatch.setattr(redis_core, "get_rag_readiness", fake_readiness)
+
+    async with ToolManager() as manager:
+        names = [tool.name for tool in manager.get_tools_for_llm()]
+
+    assert any(name.startswith("knowledge_") and name.endswith("search") for name in names)
 
 
 @pytest.mark.asyncio

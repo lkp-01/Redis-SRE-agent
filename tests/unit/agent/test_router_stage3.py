@@ -20,6 +20,13 @@ from redis_sre_agent.tools import manager as tool_manager_module
 from redis_sre_agent.tools.manager import ToolManager
 
 
+@pytest.fixture(autouse=True)
+def offline_router_llm(monkeypatch) -> None:
+    """Stage 3 单元测试固定走本地 fallback，不读取开发机 chat key。"""
+
+    monkeypatch.setattr("redis_sre_agent.agent.router.settings.openai_api_key", None)
+
+
 class FakeInfoClient:
     """只提供 INFO，保证曳光弹测试不连接真实 Redis。"""
 

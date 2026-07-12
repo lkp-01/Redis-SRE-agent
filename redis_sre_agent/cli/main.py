@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 
 import click
@@ -24,6 +25,8 @@ configure_cli_logging()
 
 # 定义动态加载（懒加载）的命令映射表，Key 为命令行命令，Value 为实际代码文件和函数的路径字符串
 _COMMANDS = {
+    "knowledge": "redis_sre_agent.cli.knowledge:knowledge",
+    "pipeline": "redis_sre_agent.cli.pipeline:pipeline",
     "query": "redis_sre_agent.cli.query:query",
 }
 
@@ -43,8 +46,19 @@ def version() -> None:
 @click.command()
 def status() -> None:
     """Show the current diagnostic slice status."""
-    # 在控制台打印当前诊断系统的就绪状态
-    click.echo("redis-sre-agent 诊断切片：Stage 5 LangGraph Agent 主链路可以正常启动")
+    from redis_sre_agent.core.config import settings
+    from redis_sre_agent.core.redis import get_rag_readiness
+
+    readiness = asyncio.run(get_rag_readiness(settings))
+    click.echo(
+        "redis-sre-agent 诊断切片：Stage 5 LangGraph 主链保持不变；"
+        "Stage 8 RAG 最小闭环已接入"
+    )
+    click.echo(
+        "RAG: "
+        f"{readiness.state} "
+        f"(reason={readiness.reason_code}) - {readiness.message}"
+    )
 
 
 # 继承 click.MultiCommand 自定义一个命令组类，用于支持“按需延迟加载（Lazy Loading）”
