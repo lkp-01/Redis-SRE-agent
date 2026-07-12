@@ -40,6 +40,40 @@ Stage 5 已落实“持久任务执行与可验证入口”的裁剪版主链：
 - knowledge provider 是 dummy slot，只返回空结果，避免提前实现 RAG。
 - terminal synthesis 的确定性报告只用于 fake LLM fallback/test helper；正式主链仍是 StateGraph + ToolManager 工具循环。
 
+## DeepSeek 模型配置
+
+当前真实 LLM 路径使用 DeepSeek 的 OpenAI-compatible API。复制 `.env.example` 为
+`.env`，只在本地填写真实 key：
+
+```dotenv
+# 只在本地 .env 中填写，不要提交真实值
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.deepseek.com
+OPENAI_MODEL=deepseek-v4-pro
+OPENAI_MODEL_MINI=deepseek-v4-flash
+OPENAI_MODEL_NANO=deepseek-v4-flash
+LLM_FAILOVER_ENABLED=true
+DEEPSEEK_THINKING_MODE=disabled
+```
+
+- ChatAgent 和 SRELangGraphAgent 默认使用 `deepseek-v4-pro`。
+- Pro 的某一次模型调用抛出异常时，同一批消息和工具定义会切换给
+  `deepseek-v4-flash`；不会重新创建 Thread，也不会主动重放已经完成的 Redis 工具。
+- router 使用 `deepseek-v4-flash`，失败时退回确定性文本规则。
+- 没有配置 key 时使用 fake LLM，保证本地测试不联网；已经配置但主副模型都失败时，
+  返回清洗后的失败信息，不伪造成功结果。
+- 第一版显式关闭 thinking mode。thinking 工具循环所需的 `reasoning_content` 无损回传
+  留作后续增强。
+
+真实 API smoke test 需要显式开启：
+
+```powershell
+$env:RUN_DEEPSEEK_LIVE_TESTS = "1"
+python -m pytest -o addopts="" -q -m integration tests/integration/test_deepseek_live.py
+```
+
+测试只绑定一个无副作用的本地工具，不连接真实 Redis，也不会打印模型响应全文或密钥。
+
 ## 运行测试
 
 请在 `D:\developer\redis_sre_prac\my_sre_agent` 执行：
@@ -50,7 +84,8 @@ python -m compileall redis_sre_agent tests
 python -m pytest -q
 ```
 
-测试全部使用 fake Redis client、fake LLM 或 fake backend，不依赖真实 OpenAI API、真实 Redis 服务或外部网络。
+默认测试使用 fake Redis client、fake LLM 或 fake backend，不依赖真实 Redis 服务或外部网络；
+只有显式开启的 `integration` 测试会访问 DeepSeek。
 
 ## CLI 示例
 

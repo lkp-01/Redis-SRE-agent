@@ -22,6 +22,13 @@ def test_settings_can_be_created_without_real_external_secrets() -> None:
     assert settings.debug is False
     assert isinstance(settings.redis_url, SecretStr)
     assert settings.openai_api_key is None
+    assert settings.openai_base_url == "https://api.deepseek.com"
+    assert settings.openai_model == "deepseek-v4-pro"
+    assert settings.openai_model_mini == "deepseek-v4-flash"
+    assert settings.openai_model_nano == "deepseek-v4-flash"
+    assert settings.llm_timeout == 180.0
+    assert settings.llm_failover_enabled is True
+    assert settings.deepseek_thinking_mode == "disabled"
 
 
 def test_secretstr_does_not_leak_in_repr() -> None:
@@ -43,6 +50,10 @@ def test_environment_overrides_defaults() -> None:
         "HOST": "127.0.0.1",
         "PORT": "9001",
         "REDIS_URL": "LOCAL_TEST_REDIS_REFERENCE",
+        "OPENAI_MODEL": "primary-test-model",
+        "OPENAI_MODEL_MINI": "fallback-test-model",
+        "LLM_FAILOVER_ENABLED": "false",
+        "DEEPSEEK_THINKING_MODE": "enabled",
     }
     with patch.dict(os.environ, env, clear=True):
         settings = Settings(_env_file=None)
@@ -53,6 +64,10 @@ def test_environment_overrides_defaults() -> None:
     assert settings.host == "127.0.0.1"
     assert settings.port == 9001
     assert settings.redis_url.get_secret_value() == "LOCAL_TEST_REDIS_REFERENCE"
+    assert settings.openai_model == "primary-test-model"
+    assert settings.openai_model_mini == "fallback-test-model"
+    assert settings.llm_failover_enabled is False
+    assert settings.deepseek_thinking_mode == "enabled"
 
 
 def test_yaml_config_file_loads_and_env_wins(tmp_path: Path) -> None:

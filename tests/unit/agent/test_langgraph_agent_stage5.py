@@ -10,8 +10,11 @@ import pytest
 from pydantic import SecretStr
 from langgraph.graph import StateGraph
 
+from redis_sre_agent.agent import langgraph_agent as langgraph_agent_module
+from redis_sre_agent.agent._compat import FakeToolCallingLLM
 from redis_sre_agent.agent.langgraph_agent import SRELangGraphAgent, get_sre_agent
 from redis_sre_agent.agent.models import AgentResponse
+from redis_sre_agent.core import llm_helpers
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
@@ -78,6 +81,25 @@ def make_instance() -> RedisInstance:
     )
 
 
+def test_langgraph_agent_prefers_explicit_llm() -> None:
+    explicit_llm = object()
+
+    agent = SRELangGraphAgent(llm=explicit_llm)
+
+    assert agent.llm is explicit_llm
+
+
+def test_langgraph_agent_uses_real_factory_only_when_key_is_configured(monkeypatch) -> None:
+    real_llm = object()
+    monkeypatch.setattr(langgraph_agent_module.settings, "openai_api_key", SecretStr("configured"))
+    monkeypatch.setattr(llm_helpers, "create_llm", lambda: real_llm)
+
+    assert SRELangGraphAgent().llm is real_llm
+
+    monkeypatch.setattr(langgraph_agent_module.settings, "openai_api_key", None)
+    assert isinstance(SRELangGraphAgent().llm, FakeToolCallingLLM)
+
+
 def test_get_sre_agent_returns_new_instance_each_time() -> None:
     first = get_sre_agent(redis_instance=make_instance())
     second = get_sre_agent(redis_instance=make_instance())
@@ -126,7 +148,7 @@ async def test_langgraph_agent_triage_facade_collects_extended_evidence(monkeypa
     assert _PASSWORD not in payload
     assert _URL not in payload
     assert any(name.startswith("langgraph") for name in sys.modules)
-    assert not any(name.startswith("openai") for name in sys.modules)
+    assert isinstance(agent.llm, FakeToolCallingLLM)
 
 
 @pytest.mark.asyncio

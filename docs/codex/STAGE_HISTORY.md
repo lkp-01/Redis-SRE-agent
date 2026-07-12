@@ -1,5 +1,38 @@
 # Stage History
 
+## 2026-07-12 Stage 5 DeepSeek LLM integration
+
+### 完成内容
+
+- 增加 `langchain-openai` 依赖，恢复 original 风格的 main/mini/nano LLM 工厂。
+- 默认配置 `deepseek-v4-pro` 主模型和 `deepseek-v4-flash` 副模型/轻量模型。
+- Pro 单次调用失败后将同一输入切换给 Flash，不重启 StateGraph 或主动重放 Redis 工具。
+- ChatAgent、SRELangGraphAgent 和 router 接入真实模型工厂；显式 LLM 注入仍具有最高优先级。
+- 无 key 时保留 fake tool-calling LLM；router 模型失败时保留确定性路由 fallback。
+- 增加不含密钥的 `.env.example`、单元测试和显式启用的真实 DeepSeek smoke test。
+- 第一版显式关闭 thinking mode，避免工具轮次遗漏 `reasoning_content`。
+
+### 从 original 复制或适配的形状
+
+- `core/llm_helpers.py` 的 `create_llm`、`create_mini_llm`、`create_nano_llm` 公共名称。
+- `ChatOpenAI(model/api_key/base_url/timeout)` 集中创建边界。
+- ChatAgent/SRELangGraphAgent 使用 main，router 使用 nano 的职责划分。
+
+### 有意保留的插槽
+
+- thinking mode 的 `reasoning_content` 跨工具轮次回传。
+- 多 base URL、多 key、多供应商主副容灾。
+- 指数退避、熔断、健康状态、token/费用/延迟观测。
+- streaming、完整 structured output wrapper、DeepSeek strict schema。
+
+### 验证结果
+
+- 改动前基线：67 passed。
+- 新增配置/工厂测试：10 passed。
+- Agent/router/Stage 5 E2E focused：18 passed。
+- 完整测试：78 passed，2 skipped。
+- 2 个 live tests 因本机没有 DeepSeek key 且未开启 live 开关而跳过，未伪造真实连通性结论。
+
 ## 2026-07-09 Stage 5 final closure
 
 ### 完成内容

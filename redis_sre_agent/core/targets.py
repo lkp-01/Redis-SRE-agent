@@ -112,91 +112,89 @@ class BoundTargetScope(BaseModel):
     context_updates: Dict[str, Any] = Field(default_factory=dict)
 
 
-def _normalize(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-def _normalize_environment(value: Any) -> str:
-    normalized = _normalize(value)
-    return _ENV_ALIASES.get(normalized, normalized)
-
-
-def _tokenize(value: Any) -> List[str]:
-    return _TOKEN_RE.findall(_normalize(value))
-
-
-def _dedupe(values: Iterable[Any]) -> List[str]:
-    seen: set[str] = set()
-    result: List[str] = []
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(text)
-    return result
-
-
-def _safe_repo_tokens(repo_url: Optional[str]) -> tuple[Optional[str], List[str]]:
-    if not repo_url:
-        return None, []
-    try:
-        parsed = urlparse(repo_url)
-        path_bits = [bit for bit in parsed.path.strip("/").split("/") if bit]
-        if len(path_bits) >= 2:
-            slug = "/".join(path_bits[-2:])
-        elif path_bits:
-            slug = path_bits[-1]
-        else:
-            slug = None
-        tokens = _tokenize(slug or "")
-        return slug, tokens
-    except Exception:
-        return None, []
-
-
-def _extract_safe_aliases(extension_data: Optional[Dict[str, Any]]) -> List[str]:
-    if not isinstance(extension_data, dict):
-        return []
-    aliases: List[Any] = []
-    raw_aliases = extension_data.get("aliases")
-    if isinstance(raw_aliases, list):
-        aliases.extend(raw_aliases)
-    target_discovery = extension_data.get("target_discovery")
-    if isinstance(target_discovery, dict):
-        nested_aliases = target_discovery.get("aliases")
-        if isinstance(nested_aliases, list):
-            aliases.extend(nested_aliases)
-    return _dedupe(aliases)
-
-
-def _instance_capabilities(instance: RedisInstance) -> List[str]:
-    capabilities = ["redis", "diagnostics", "metrics", "logs"]
-    instance_type = _normalize(
-        instance.instance_type.value
-        if hasattr(instance.instance_type, "value")
-        else instance.instance_type
+async def resolve_target_query(
+    *,
+    query: str,
+    user_id: Optional[str] = None,
+    allow_multiple: bool = False,
+    max_results: int = 5,
+    preferred_capabilities: Optional[Sequence[str]] = None,
+) -> TargetResolutionResult:
+    service = TargetDiscoveryService()
+    return await service.resolve(
+        DiscoveryRequest(
+            query=query,
+            allow_multiple=allow_multiple,
+            max_results=max_results,
+            preferred_capabilities=list(preferred_capabilities or []),
+            user_id=user_id,
+        )
     )
-    if instance_type == "redis_enterprise":
-        capabilities.append("admin")
-    if instance_type == "redis_cloud":
-        capabilities.append("cloud")
-    return _dedupe(capabilities)
 
 
-def _cluster_capabilities(cluster: RedisCluster) -> List[str]:
-    cluster_type = _normalize(
-        cluster.cluster_type.value if hasattr(cluster.cluster_type, "value") else cluster.cluster_type
-    )
-    capabilities = ["redis", "diagnostics", "metrics", "logs"]
-    if cluster_type == "redis_enterprise":
-        capabilities.append("admin")
-    if cluster_type == "redis_cloud":
-        capabilities.append("cloud")
-    return _dedupe(capabilities)
+async def list_known_targets(
+    *,
+    user_id: Optional[str] = None,
+    target_kind: Optional[str] = None,
+    environment: Optional[str] = None,
+    capability: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    include_aliases: bool = False,
+) -> Dict[str, Any]:
+    docs = await get_target_catalog(user_id=user_id)
+    normalized_kind = _normalize(target_kind)
+    normalized_environment = _normalize_environment(environment)
+    normalized_capability = _normalize(capability)
+
+    filtered: List[TargetCatalogDoc] = []
+    for doc in docs:
+        if normalized_kind and _normalize(doc.target_kind) != normalized_kind:
+            continue
+        if normalized_environment and _normalize_environment(doc.environment) != normalized_environment:
+            continue
+        if normalized_capability:
+            supported = {_normalize(item) for item in doc.capabilities}
+            if normalized_capability not in supported:
+                continue
+        filtered.append(doc)
+
+    total = len(filtered)
+    bounded_limit = max(1, min(int(limit), 100))
+    bounded_offset = max(0, int(offset))
+    page = filtered[bounded_offset : bounded_offset + bounded_limit]
+    return {
+        "status": "ok",
+        "total_known_targets": total,
+        "returned_targets": len(page),
+        "offset": bounded_offset,
+        "limit": bounded_limit,
+        "has_more": (bounded_offset + len(page)) < total,
+        "targets": [
+            build_public_target_inventory_entry(doc, include_aliases=include_aliases)
+            for doc in page
+        ],
+    }
+
+
+async def get_target_catalog(*, user_id: Optional[str] = None) -> List[TargetCatalogDoc]:
+    """从阶段二资源层读取 Redis target 安全目录。"""
+
+    docs = build_target_catalog_docs(await get_instances(), await get_clusters())
+    filtered = [
+        doc for doc in docs if not user_id or doc.user_id in {None, "", user_id}
+    ]
+    filtered.sort(key=lambda doc: doc.updated_at, reverse=True)
+    return filtered
+
+
+def build_target_catalog_docs(
+    instances: Sequence[RedisInstance],
+    clusters: Sequence[RedisCluster],
+) -> List[TargetCatalogDoc]:
+    docs = [build_target_doc_from_instance(instance) for instance in instances]
+    docs.extend(build_target_doc_from_cluster(cluster) for cluster in clusters)
+    return docs
 
 
 def build_target_doc_from_instance(instance: RedisInstance) -> TargetCatalogDoc:
@@ -293,26 +291,6 @@ def build_target_doc_from_cluster(cluster: RedisCluster) -> TargetCatalogDoc:
     )
 
 
-def build_target_catalog_docs(
-    instances: Sequence[RedisInstance],
-    clusters: Sequence[RedisCluster],
-) -> List[TargetCatalogDoc]:
-    docs = [build_target_doc_from_instance(instance) for instance in instances]
-    docs.extend(build_target_doc_from_cluster(cluster) for cluster in clusters)
-    return docs
-
-
-async def get_target_catalog(*, user_id: Optional[str] = None) -> List[TargetCatalogDoc]:
-    """从阶段二资源层读取 Redis target 安全目录。"""
-
-    docs = build_target_catalog_docs(await get_instances(), await get_clusters())
-    filtered = [
-        doc for doc in docs if not user_id or doc.user_id in {None, "", user_id}
-    ]
-    filtered.sort(key=lambda doc: doc.updated_at, reverse=True)
-    return filtered
-
-
 def build_public_target_inventory_entry(
     doc: TargetCatalogDoc,
     *,
@@ -335,109 +313,97 @@ def build_public_target_inventory_entry(
     }
 
 
-async def list_known_targets(
+async def build_seed_hint_candidates(
     *,
-    user_id: Optional[str] = None,
-    target_kind: Optional[str] = None,
-    environment: Optional[str] = None,
-    capability: Optional[str] = None,
-    limit: int = 20,
-    offset: int = 0,
-    include_aliases: bool = False,
-) -> Dict[str, Any]:
-    docs = await get_target_catalog(user_id=user_id)
-    normalized_kind = _normalize(target_kind)
-    normalized_environment = _normalize_environment(environment)
-    normalized_capability = _normalize(capability)
+    bindings: Optional[Sequence[TargetBinding]] = None,
+    instance_id: Optional[str] = None,
+    cluster_id: Optional[str] = None,
+) -> List[DiscoveryCandidate]:
+    """从显式 instance_id/cluster_id 构造候选项，给 CLI 和测试留兼容入口。"""
 
-    filtered: List[TargetCatalogDoc] = []
-    for doc in docs:
-        if normalized_kind and _normalize(doc.target_kind) != normalized_kind:
-            continue
-        if normalized_environment and _normalize_environment(doc.environment) != normalized_environment:
-            continue
-        if normalized_capability:
-            supported = {_normalize(item) for item in doc.capabilities}
-            if normalized_capability not in supported:
-                continue
-        filtered.append(doc)
+    if instance_id and cluster_id:
+        raise ValueError("Please provide only one of instance_id or cluster_id")
 
-    total = len(filtered)
-    bounded_limit = max(1, min(int(limit), 100))
-    bounded_offset = max(0, int(offset))
-    page = filtered[bounded_offset : bounded_offset + bounded_limit]
-    return {
-        "status": "ok",
-        "total_known_targets": total,
-        "returned_targets": len(page),
-        "offset": bounded_offset,
-        "limit": bounded_limit,
-        "has_more": (bounded_offset + len(page)) < total,
-        "targets": [
-            build_public_target_inventory_entry(doc, include_aliases=include_aliases)
-            for doc in page
-        ],
-    }
+    candidates: List[DiscoveryCandidate] = []
+    seen: set[tuple[str, str]] = set()
 
+    async def _append_candidate(
+        *,
+        target_kind: str,
+        binding_subject: str,
+        binding: Optional[TargetBinding] = None,
+    ) -> None:
+        subject = str(binding_subject or "").strip()
+        kind = str(target_kind or "").strip().lower()
+        if not subject or kind not in {"instance", "cluster"}:
+            return
+        identity = (kind, subject)
+        if identity in seen:
+            return
+        seen.add(identity)
 
-def _parse_query_hints(query: str) -> Dict[str, Any]:
-    normalized = _normalize(query)
-    token_list = _tokenize(normalized)
-    tokens = set(token_list)
-    environments = {_ENV_ALIASES[token] for token in tokens if token in _ENV_ALIASES}
-    usages = {token for token in tokens if token in _USAGE_TERMS}
-    preferred_kinds = set()
-    if tokens & _INSTANCE_HINTS:
-        preferred_kinds.add("instance")
-    if tokens & _CLUSTER_HINTS:
-        preferred_kinds.add("cluster")
-    target_types = {_TYPE_HINTS[token] for token in tokens if token in _TYPE_HINTS}
-    hostname_terms = {_normalize(term) for term in _HOSTNAME_RE.findall(normalized)}
-    return {
-        "normalized": normalized,
-        "tokens": tokens,
-        "token_list": token_list,
-        "environments": environments,
-        "usages": usages,
-        "preferred_kinds": preferred_kinds,
-        "target_types": target_types,
-        "hostname_terms": hostname_terms,
-    }
+        doc: Optional[TargetCatalogDoc] = None
+        if kind == "instance":
+            instance = await get_instance_by_id(subject)
+            if instance is not None:
+                doc = build_target_doc_from_instance(instance)
+        elif kind == "cluster":
+            cluster = await get_cluster_by_id(subject)
+            if cluster is not None:
+                doc = build_target_doc_from_cluster(cluster)
+
+        if doc is not None:
+            public_match = build_public_match_from_doc(doc, match_reasons=[f"matched {kind}_id"])
+        else:
+            public_match = PublicTargetMatch(
+                target_kind=kind,
+                display_name=(binding.display_name if binding else None) or subject,
+                capabilities=list((binding.capabilities if binding else None) or []),
+                confidence=1.0,
+                match_reasons=[f"matched {kind}_id"],
+                public_metadata=dict((binding.public_metadata if binding else None) or {}),
+                resource_id=subject,
+                score=100.0,
+            )
+
+        candidates.append(DiscoveryCandidate.from_public_match(public_match))
+
+    for binding in bindings or []:
+        await _append_candidate(
+            target_kind=binding.target_kind,
+            binding_subject=binding.resource_id or "",
+            binding=binding,
+        )
+    if instance_id:
+        await _append_candidate(target_kind="instance", binding_subject=instance_id)
+    if cluster_id:
+        await _append_candidate(target_kind="cluster", binding_subject=cluster_id)
+    return candidates
 
 
-def _exact_target_terms(doc: TargetCatalogDoc) -> set[str]:
-    terms = {
-        _normalize(doc.display_name),
-        _normalize(doc.name),
-        _normalize(doc.monitoring_identifier),
-        _normalize(doc.logging_identifier),
-        _normalize(doc.redis_cloud_database_name),
-        _normalize(doc.repo_slug),
-    }
-    terms.update(_normalize(alias) for alias in doc.search_aliases)
-    return {term for term in terms if term}
-
-
-def _contains_token_sequence(haystack: Sequence[str], needle: Sequence[str]) -> bool:
-    if not needle or len(needle) > len(haystack):
-        return False
-    last_start = len(haystack) - len(needle)
-    for idx in range(last_start + 1):
-        if list(haystack[idx : idx + len(needle)]) == list(needle):
-            return True
-    return False
-
-
-def _query_mentions_exact_target(doc: TargetCatalogDoc, hints: Dict[str, Any]) -> bool:
-    normalized = hints["normalized"]
-    token_list = hints["token_list"]
-    for term in _exact_target_terms(doc):
-        if normalized == term:
-            return True
-        term_tokens = _tokenize(term)
-        if term_tokens and _contains_token_sequence(token_list, term_tokens):
-            return True
-    return False
+def build_public_match_from_doc(
+    doc: TargetCatalogDoc,
+    *,
+    match_reasons: Optional[Sequence[str]] = None,
+    score: float = 100.0,
+    confidence: float = 1.0,
+) -> PublicTargetMatch:
+    return PublicTargetMatch(
+        target_kind=doc.target_kind,
+        display_name=doc.display_name,
+        environment=doc.environment,
+        target_type=doc.target_type,
+        capabilities=list(doc.capabilities or []),
+        confidence=confidence,
+        match_reasons=list(match_reasons or []),
+        public_metadata={
+            key: value
+            for key, value in {"usage": doc.usage, "status": doc.status}.items()
+            if value not in (None, "")
+        },
+        resource_id=doc.resource_id,
+        score=score,
+    )
 
 
 def _score_target_doc(
@@ -523,6 +489,66 @@ def _score_target_doc(
     return score, reasons
 
 
+def _parse_query_hints(query: str) -> Dict[str, Any]:
+    normalized = _normalize(query)
+    token_list = _tokenize(normalized)
+    tokens = set(token_list)
+    environments = {_ENV_ALIASES[token] for token in tokens if token in _ENV_ALIASES}
+    usages = {token for token in tokens if token in _USAGE_TERMS}
+    preferred_kinds = set()
+    if tokens & _INSTANCE_HINTS:
+        preferred_kinds.add("instance")
+    if tokens & _CLUSTER_HINTS:
+        preferred_kinds.add("cluster")
+    target_types = {_TYPE_HINTS[token] for token in tokens if token in _TYPE_HINTS}
+    hostname_terms = {_normalize(term) for term in _HOSTNAME_RE.findall(normalized)}
+    return {
+        "normalized": normalized,
+        "tokens": tokens,
+        "token_list": token_list,
+        "environments": environments,
+        "usages": usages,
+        "preferred_kinds": preferred_kinds,
+        "target_types": target_types,
+        "hostname_terms": hostname_terms,
+    }
+
+
+def _query_mentions_exact_target(doc: TargetCatalogDoc, hints: Dict[str, Any]) -> bool:
+    normalized = hints["normalized"]
+    token_list = hints["token_list"]
+    for term in _exact_target_terms(doc):
+        if normalized == term:
+            return True
+        term_tokens = _tokenize(term)
+        if term_tokens and _contains_token_sequence(token_list, term_tokens):
+            return True
+    return False
+
+
+def _exact_target_terms(doc: TargetCatalogDoc) -> set[str]:
+    terms = {
+        _normalize(doc.display_name),
+        _normalize(doc.name),
+        _normalize(doc.monitoring_identifier),
+        _normalize(doc.logging_identifier),
+        _normalize(doc.redis_cloud_database_name),
+        _normalize(doc.repo_slug),
+    }
+    terms.update(_normalize(alias) for alias in doc.search_aliases)
+    return {term for term in terms if term}
+
+
+def _contains_token_sequence(haystack: Sequence[str], needle: Sequence[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    last_start = len(haystack) - len(needle)
+    for idx in range(last_start + 1):
+        if list(haystack[idx : idx + len(needle)]) == list(needle):
+            return True
+    return False
+
+
 def _confidence_from_score(score: float) -> float:
     if score <= 0:
         return 0.0
@@ -531,187 +557,123 @@ def _confidence_from_score(score: float) -> float:
     return round(min(0.99, 0.45 + (score / 20.0)), 2)
 
 
-async def resolve_target_query(
-    *,
-    query: str,
-    user_id: Optional[str] = None,
-    allow_multiple: bool = False,
-    max_results: int = 5,
-    preferred_capabilities: Optional[Sequence[str]] = None,
-) -> TargetResolutionResult:
-    service = TargetDiscoveryService()
-    return await service.resolve(
-        DiscoveryRequest(
-            query=query,
-            allow_multiple=allow_multiple,
-            max_results=max_results,
-            preferred_capabilities=list(preferred_capabilities or []),
-            user_id=user_id,
-        )
-    )
-
-
-def build_public_match_from_doc(
-    doc: TargetCatalogDoc,
-    *,
-    match_reasons: Optional[Sequence[str]] = None,
-    score: float = 100.0,
-    confidence: float = 1.0,
-) -> PublicTargetMatch:
-    return PublicTargetMatch(
-        target_kind=doc.target_kind,
-        display_name=doc.display_name,
-        environment=doc.environment,
-        target_type=doc.target_type,
-        capabilities=list(doc.capabilities or []),
-        confidence=confidence,
-        match_reasons=list(match_reasons or []),
-        public_metadata={
-            key: value
-            for key, value in {"usage": doc.usage, "status": doc.status}.items()
-            if value not in (None, "")
-        },
-        resource_id=doc.resource_id,
-        score=score,
-    )
-
-
-def get_attached_target_handles_from_context(context: Optional[Dict[str, Any]]) -> List[str]:
-    if not isinstance(context, dict):
-        return []
-    raw_handles = context.get("attached_target_handles") or []
-    if not isinstance(raw_handles, list):
-        return []
-    return [str(handle).strip() for handle in raw_handles if str(handle or "").strip()]
-
-
-def get_target_bindings_from_context(context: Optional[Dict[str, Any]]) -> List[TargetBinding]:
-    if not isinstance(context, dict):
-        return []
-    raw_bindings = context.get("target_bindings") or []
-    if not isinstance(raw_bindings, list):
-        return []
-    bindings: List[TargetBinding] = []
-    for raw_binding in raw_bindings:
-        try:
-            bindings.append(TargetBinding.model_validate(raw_binding))
-        except Exception:
-            continue
-    return bindings
-
-
-async def resolve_binding_subject(binding: Optional[TargetBinding]) -> Optional[str]:
-    """从 public binding 摘要解析 private subject 的阶段三兼容入口。"""
-    if binding is None:
-        return None
-    return binding.resource_id
-
-
-def build_bound_target_scope_context(
-    bindings: Sequence[TargetBinding],
-    *,
-    generation: int,
-    active_handle: Optional[str] = None,
-) -> Dict[str, Any]:
-    attached_bindings = list(bindings)
-    attached_handles = [binding.target_handle for binding in attached_bindings]
-    resolved_active_handle = active_handle or (
-        attached_bindings[0].target_handle if attached_bindings else ""
-    )
-    return {
-        "attached_target_handles": attached_handles,
-        "active_target_handle": resolved_active_handle or "",
-        "target_toolset_generation": generation,
-        "target_bindings": [binding.public_dump() for binding in attached_bindings],
-        "instance_id": "",
-        "cluster_id": "",
-    }
-
-
-async def build_seed_hint_candidates(
-    *,
-    bindings: Optional[Sequence[TargetBinding]] = None,
-    instance_id: Optional[str] = None,
-    cluster_id: Optional[str] = None,
-) -> List[DiscoveryCandidate]:
-    """从显式 instance_id/cluster_id 构造候选项，给 CLI 和测试留兼容入口。"""
-
-    if instance_id and cluster_id:
-        raise ValueError("Please provide only one of instance_id or cluster_id")
-
-    candidates: List[DiscoveryCandidate] = []
-    seen: set[tuple[str, str]] = set()
-
-    async def _append_candidate(
-        *,
-        target_kind: str,
-        binding_subject: str,
-        binding: Optional[TargetBinding] = None,
-    ) -> None:
-        subject = str(binding_subject or "").strip()
-        kind = str(target_kind or "").strip().lower()
-        if not subject or kind not in {"instance", "cluster"}:
-            return
-        identity = (kind, subject)
-        if identity in seen:
-            return
-        seen.add(identity)
-
-        doc: Optional[TargetCatalogDoc] = None
-        if kind == "instance":
-            instance = await get_instance_by_id(subject)
-            if instance is not None:
-                doc = build_target_doc_from_instance(instance)
-        elif kind == "cluster":
-            cluster = await get_cluster_by_id(subject)
-            if cluster is not None:
-                doc = build_target_doc_from_cluster(cluster)
-
-        if doc is not None:
-            public_match = build_public_match_from_doc(doc, match_reasons=[f"matched {kind}_id"])
-        else:
-            public_match = PublicTargetMatch(
-                target_kind=kind,
-                display_name=(binding.display_name if binding else None) or subject,
-                capabilities=list((binding.capabilities if binding else None) or []),
-                confidence=1.0,
-                match_reasons=[f"matched {kind}_id"],
-                public_metadata=dict((binding.public_metadata if binding else None) or {}),
-                resource_id=subject,
-                score=100.0,
-            )
-
-        candidates.append(DiscoveryCandidate.from_public_match(public_match))
-
-    for binding in bindings or []:
-        await _append_candidate(
-            target_kind=binding.target_kind,
-            binding_subject=binding.resource_id or "",
-            binding=binding,
-        )
-    if instance_id:
-        await _append_candidate(target_kind="instance", binding_subject=instance_id)
-    if cluster_id:
-        await _append_candidate(target_kind="cluster", binding_subject=cluster_id)
-    return candidates
-
-
-async def get_thread_target_state(thread_id: str) -> ThreadTargetState:
-    """从 thread context 读取已绑定 target 状态。"""
-
+def _safe_repo_tokens(repo_url: Optional[str]) -> tuple[Optional[str], List[str]]:
+    if not repo_url:
+        return None, []
     try:
-        from redis_sre_agent.core.threads import ThreadManager
-
-        thread = await ThreadManager().get_thread(thread_id)
+        parsed = urlparse(repo_url)
+        path_bits = [bit for bit in parsed.path.strip("/").split("/") if bit]
+        if len(path_bits) >= 2:
+            slug = "/".join(path_bits[-2:])
+        elif path_bits:
+            slug = path_bits[-1]
+        else:
+            slug = None
+        tokens = _tokenize(slug or "")
+        return slug, tokens
     except Exception:
-        thread = None
-    if thread is None:
-        return ThreadTargetState()
-    return ThreadTargetState(
-        attached_target_handles=get_attached_target_handles_from_context(thread.context),
-        active_target_handle=str(thread.context.get("active_target_handle") or "") or None,
-        target_toolset_generation=int(thread.context.get("target_toolset_generation") or 0),
-        target_bindings=get_target_bindings_from_context(thread.context),
+        return None, []
+
+
+def _extract_safe_aliases(extension_data: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(extension_data, dict):
+        return []
+    aliases: List[Any] = []
+    raw_aliases = extension_data.get("aliases")
+    if isinstance(raw_aliases, list):
+        aliases.extend(raw_aliases)
+    target_discovery = extension_data.get("target_discovery")
+    if isinstance(target_discovery, dict):
+        nested_aliases = target_discovery.get("aliases")
+        if isinstance(nested_aliases, list):
+            aliases.extend(nested_aliases)
+    return _dedupe(aliases)
+
+
+def _instance_capabilities(instance: RedisInstance) -> List[str]:
+    capabilities = ["redis", "diagnostics", "metrics", "logs"]
+    instance_type = _normalize(
+        instance.instance_type.value
+        if hasattr(instance.instance_type, "value")
+        else instance.instance_type
+    )
+    if instance_type == "redis_enterprise":
+        capabilities.append("admin")
+    if instance_type == "redis_cloud":
+        capabilities.append("cloud")
+    return _dedupe(capabilities)
+
+
+def _cluster_capabilities(cluster: RedisCluster) -> List[str]:
+    cluster_type = _normalize(
+        cluster.cluster_type.value if hasattr(cluster.cluster_type, "value") else cluster.cluster_type
+    )
+    capabilities = ["redis", "diagnostics", "metrics", "logs"]
+    if cluster_type == "redis_enterprise":
+        capabilities.append("admin")
+    if cluster_type == "redis_cloud":
+        capabilities.append("cloud")
+    return _dedupe(capabilities)
+
+
+def _normalize_environment(value: Any) -> str:
+    normalized = _normalize(value)
+    return _ENV_ALIASES.get(normalized, normalized)
+
+
+def _tokenize(value: Any) -> List[str]:
+    return _TOKEN_RE.findall(_normalize(value))
+
+
+def _normalize(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _dedupe(values: Iterable[Any]) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+async def bind_target_matches(
+    *,
+    matches: Sequence[DiscoveryCandidate],
+    thread_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    replace_existing: bool = False,
+    manager: Optional[Any] = None,
+) -> BoundTargetScope:
+    materialized = await materialize_bound_target_scope(
+        matches=matches,
+        thread_id=thread_id,
+        task_id=task_id,
+        replace_existing=replace_existing,
+    )
+    attached_bindings = list(materialized.attached_bindings)
+    generation = materialized.target_toolset_generation
+    if manager and attached_bindings:
+        await manager.attach_bound_targets(attached_bindings, generation=generation)
+        updated_generation = manager.get_toolset_generation()
+        if inspect.isawaitable(updated_generation):
+            updated_generation = await updated_generation
+        generation = int(updated_generation)
+    return BoundTargetScope(
+        bindings=attached_bindings,
+        toolset_generation=generation,
+        context_updates=build_bound_target_scope_context(
+            attached_bindings,
+            generation=generation,
+            active_handle=materialized.context_updates.get("active_target_handle"),
+        ),
     )
 
 
@@ -768,34 +730,72 @@ async def materialize_bound_target_scope(
     )
 
 
-async def bind_target_matches(
+def build_bound_target_scope_context(
+    bindings: Sequence[TargetBinding],
     *,
-    matches: Sequence[DiscoveryCandidate],
-    thread_id: Optional[str] = None,
-    task_id: Optional[str] = None,
-    replace_existing: bool = False,
-    manager: Optional[Any] = None,
-) -> BoundTargetScope:
-    materialized = await materialize_bound_target_scope(
-        matches=matches,
-        thread_id=thread_id,
-        task_id=task_id,
-        replace_existing=replace_existing,
+    generation: int,
+    active_handle: Optional[str] = None,
+) -> Dict[str, Any]:
+    attached_bindings = list(bindings)
+    attached_handles = [binding.target_handle for binding in attached_bindings]
+    resolved_active_handle = active_handle or (
+        attached_bindings[0].target_handle if attached_bindings else ""
     )
-    attached_bindings = list(materialized.attached_bindings)
-    generation = materialized.target_toolset_generation
-    if manager and attached_bindings:
-        await manager.attach_bound_targets(attached_bindings, generation=generation)
-        updated_generation = manager.get_toolset_generation()
-        if inspect.isawaitable(updated_generation):
-            updated_generation = await updated_generation
-        generation = int(updated_generation)
-    return BoundTargetScope(
-        bindings=attached_bindings,
-        toolset_generation=generation,
-        context_updates=build_bound_target_scope_context(
-            attached_bindings,
-            generation=generation,
-            active_handle=materialized.context_updates.get("active_target_handle"),
-        ),
+    return {
+        "attached_target_handles": attached_handles,
+        "active_target_handle": resolved_active_handle or "",
+        "target_toolset_generation": generation,
+        "target_bindings": [binding.public_dump() for binding in attached_bindings],
+        "instance_id": "",
+        "cluster_id": "",
+    }
+
+
+async def get_thread_target_state(thread_id: str) -> ThreadTargetState:
+    """从 thread context 读取已绑定 target 状态。"""
+
+    try:
+        from redis_sre_agent.core.threads import ThreadManager
+
+        thread = await ThreadManager().get_thread(thread_id)
+    except Exception:
+        thread = None
+    if thread is None:
+        return ThreadTargetState()
+    return ThreadTargetState(
+        attached_target_handles=get_attached_target_handles_from_context(thread.context),
+        active_target_handle=str(thread.context.get("active_target_handle") or "") or None,
+        target_toolset_generation=int(thread.context.get("target_toolset_generation") or 0),
+        target_bindings=get_target_bindings_from_context(thread.context),
     )
+
+
+def get_attached_target_handles_from_context(context: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(context, dict):
+        return []
+    raw_handles = context.get("attached_target_handles") or []
+    if not isinstance(raw_handles, list):
+        return []
+    return [str(handle).strip() for handle in raw_handles if str(handle or "").strip()]
+
+
+def get_target_bindings_from_context(context: Optional[Dict[str, Any]]) -> List[TargetBinding]:
+    if not isinstance(context, dict):
+        return []
+    raw_bindings = context.get("target_bindings") or []
+    if not isinstance(raw_bindings, list):
+        return []
+    bindings: List[TargetBinding] = []
+    for raw_binding in raw_bindings:
+        try:
+            bindings.append(TargetBinding.model_validate(raw_binding))
+        except Exception:
+            continue
+    return bindings
+
+
+async def resolve_binding_subject(binding: Optional[TargetBinding]) -> Optional[str]:
+    """从 public binding 摘要解析 private subject 的阶段三兼容入口。"""
+    if binding is None:
+        return None
+    return binding.resource_id

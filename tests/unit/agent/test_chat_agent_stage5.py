@@ -9,8 +9,11 @@ import pytest
 from pydantic import SecretStr
 from langgraph.graph import StateGraph
 
+from redis_sre_agent.agent import chat_agent as chat_agent_module
+from redis_sre_agent.agent._compat import FakeToolCallingLLM
 from redis_sre_agent.agent.chat_agent import ChatAgent, get_chat_agent
 from redis_sre_agent.agent.models import AgentResponse
+from redis_sre_agent.core import llm_helpers
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
@@ -77,6 +80,25 @@ def _assert_no_sensitive_payload(value: Any) -> None:
     assert _TOKEN not in payload
     assert _URL not in payload
     assert "SecretStr" not in payload
+
+
+def test_chat_agent_prefers_explicit_llm() -> None:
+    explicit_llm = object()
+
+    agent = ChatAgent(llm=explicit_llm)
+
+    assert agent.llm is explicit_llm
+
+
+def test_chat_agent_uses_real_factory_only_when_key_is_configured(monkeypatch) -> None:
+    real_llm = object()
+    monkeypatch.setattr(chat_agent_module.settings, "openai_api_key", SecretStr("configured"))
+    monkeypatch.setattr(llm_helpers, "create_llm", lambda: real_llm)
+
+    assert ChatAgent().llm is real_llm
+
+    monkeypatch.setattr(chat_agent_module.settings, "openai_api_key", None)
+    assert isinstance(ChatAgent().llm, FakeToolCallingLLM)
 
 
 @pytest.mark.asyncio

@@ -149,8 +149,8 @@ def query(
             "support_package_path",
             "attached_target_handles",
             "target_query",
-        }
-        routing_context = { #context中的key存在与=于routing_keys的才加入到这个字典里
+        }#这个过滤动作很重要，因为它避免把完整 thread context 全塞给 router。
+        routing_context = { #context中的key存在于routing_keys的才加入到这个字典里
             key: value
             for key, value in context.items()
             if key in routing_keys
@@ -192,7 +192,7 @@ def query(
         )
 
         assistant_message_id = str(uuid4())
-        if agent_response.tool_envelopes:# 链路追踪追踪（Trace）：如果 Agent 在思考过程中调用了任何底层工具并返回了证据包（tool_envelopes）
+        if agent_response.tool_envelopes:## 链路追踪追踪（Trace）：如果 Agent 在思考过程中调用了任何底层工具并返回了证据包（tool_envelopes）
             await thread_manager.set_message_trace(
                 message_id=assistant_message_id,
                 tool_envelopes=agent_response.tool_envelopes,

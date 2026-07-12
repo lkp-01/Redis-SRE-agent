@@ -177,11 +177,26 @@ class Settings(BaseSettings):
         description="资源层 Redis 地址。默认值不包含密码。",
     )
 
-    openai_api_key: Optional[SecretStr] = Field(default=None, description="OpenAI API key 插槽。")
-    openai_base_url: Optional[str] = Field(default=None, description="OpenAI 兼容服务地址插槽。")
-    openai_model: str = Field(default="gpt-5", description="后续 Agent 推理模型插槽。")
-    openai_model_mini: str = Field(default="gpt-5-mini", description="后续轻量模型插槽。")
-    openai_model_nano: str = Field(default="gpt-5-nano", description="后续分类模型插槽。")
+    openai_api_key: Optional[SecretStr] = Field(default=None, description="OpenAI 兼容 API key。")
+    openai_base_url: Optional[str] = Field(
+        default="https://api.deepseek.com",
+        description="OpenAI 兼容服务地址；当前默认指向 DeepSeek。",
+    )
+    openai_model: str = Field(default="deepseek-v4-pro", description="Agent 主推理模型。")
+    openai_model_mini: str = Field(
+        default="deepseek-v4-flash",
+        description="轻量任务模型，也是主模型调用失败时的副模型。",
+    )
+    openai_model_nano: str = Field(
+        default="deepseek-v4-flash",
+        description="路由和简单分类模型。",
+    )
+    llm_timeout: float = Field(default=180.0, description="单次 LLM 请求超时秒数。")
+    llm_failover_enabled: bool = Field(default=True, description="主模型失败后是否切换副模型。")
+    deepseek_thinking_mode: Literal["disabled", "enabled"] = Field(
+        default="disabled",
+        description="DeepSeek thinking 开关；首期默认关闭以稳定支持工具循环。",
+    )
 
     embedding_provider: str = Field(default="openai", description="向量化 provider 插槽。")
     embedding_model: str = Field(default="text-embedding-3-small", description="向量模型插槽。")

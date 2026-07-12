@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.graph import END, StateGraph
 
 from redis_sre_agent.core.clusters import RedisCluster
+from redis_sre_agent.core.config import settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.core.targets import TargetBinding, get_target_bindings_from_context
 from redis_sre_agent.tools.manager import ToolManager
@@ -79,9 +80,14 @@ class ChatAgent:
         self.support_package_path = support_package_path
         self._emitter = progress_emitter if progress_emitter is not None else NullEmitter()
         if llm is None:
-            from ._compat import FakeToolCallingLLM
+            if settings.openai_api_key is not None:
+                from redis_sre_agent.core.llm_helpers import create_llm
 
-            llm = FakeToolCallingLLM(agent_kind="chat")
+                llm = create_llm()
+            else:
+                from ._compat import FakeToolCallingLLM
+
+                llm = FakeToolCallingLLM(agent_kind="chat")
         self.llm = llm
 
     def _build_workflow(
