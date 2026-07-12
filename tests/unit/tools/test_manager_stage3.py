@@ -10,6 +10,13 @@ from redis_sre_agent.core.config import Settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
+from redis_sre_agent.tools.models import (
+    Tool,
+    ToolActionKind,
+    ToolCapability,
+    ToolDefinition,
+    ToolMetadata,
+)
 
 
 class FakeInfoClient:
@@ -153,3 +160,46 @@ async def test_tool_manager_execute_tool_calls_redacts_fallback_errors(monkeypat
     assert secret not in payload
     assert raw_url not in payload
     assert "[REDACTED]" in payload
+
+
+def test_llm_tool_limit_drops_mcp_before_any_builtin_tool() -> None:
+    manager = ToolManager()
+
+    def make_tool(index: int, *, provider_name: str, capability: ToolCapability) -> Tool:
+        name = f"{provider_name}_{index:02d}"
+
+        async def invoke(_args):
+            return {"status": "success"}
+
+        definition = ToolDefinition(
+            name=name,
+            description="Test tool.",
+            capability=capability,
+            parameters={"type": "object", "properties": {}},
+        )
+        return Tool(
+            metadata=ToolMetadata(
+                name=name,
+                description=definition.description,
+                capability=capability,
+                provider_name=provider_name,
+                action_kind=ToolActionKind.READ,
+            ),
+            definition=definition,
+            invoke=invoke,
+        )
+
+    manager._tools = [
+        make_tool(index, provider_name="builtin_custom", capability=ToolCapability.ADMIN)
+        for index in range(64)
+    ]
+    manager._tools.append(
+        make_tool(99, provider_name="mcp_external", capability=ToolCapability.DIAGNOSTICS)
+    )
+
+    selected = manager.get_tools_for_llm(max_tools=64)
+    selected_names = {tool.name for tool in selected}
+
+    assert len(selected) == 64
+    assert "mcp_external_99" not in selected_names
+    assert {f"builtin_custom_{index:02d}" for index in range(64)} == selected_names

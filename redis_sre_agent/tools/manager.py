@@ -10,6 +10,7 @@ import importlib
 import json
 import logging
 import re
+import shutil
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -44,6 +45,48 @@ def _safe_error_message(exc: Exception) -> str:
         message,
     )
     return message
+
+
+def _command_is_available(command: Optional[str]) -> bool:
+    """按 original 形状在启动子进程前检查命令是否存在。"""
+
+    if command is None:
+        return True
+    candidate = command.strip()
+    if not candidate:
+        return False
+    if Path(candidate).is_absolute() or "/" in candidate or "\\" in candidate:
+        return Path(candidate).is_file()
+    return shutil.which(candidate) is not None
+
+
+def _missing_local_mcp_arg_path(args: Optional[List[str]]) -> Optional[str]:
+    """返回第一个明确指向本地、但并不存在的 MCP 入口文件。"""
+
+    for raw_arg in args or []:
+        arg = str(raw_arg or "").strip()
+        if not arg or arg.startswith("-") or any(character.isspace() for character in arg):
+            continue
+        if arg.startswith("file://"):
+            candidate = Path(arg.removeprefix("file://")).expanduser()
+        elif "://" in arg:
+            continue
+        else:
+            path = Path(arg).expanduser()
+            looks_like_script = path.suffix.lower() in {
+                ".js",
+                ".mjs",
+                ".cjs",
+                ".ts",
+                ".py",
+                ".sh",
+            }
+            if not (path.is_absolute() or arg.startswith(("./", "../", "~")) or looks_like_script):
+                continue
+            candidate = path
+        if not candidate.exists():
+            return str(candidate)
+    return None
 
 
 class ToolManager:
@@ -251,7 +294,79 @@ class ToolManager:
         return cls._provider_class_cache[provider_path]
 
     async def _load_mcp_providers(self) -> None:
-        """MCP provider 加载的阶段三 no-op 插槽。"""
+        """加载当前 turn 独占的只读 MCP provider，失败不阻断内建诊断。"""
+
+        mcp_servers = settings.mcp_servers
+        if not mcp_servers:
+            return None
+        if self._stack is None:
+            raise RuntimeError("ToolManager must be entered before loading MCP providers.")
+
+        from redis_sre_agent.core.config import MCPServerConfig
+        from redis_sre_agent.tools.mcp.provider import MCPToolProvider
+
+        excluded_capabilities = set(self.exclude_mcp_categories or [])
+        for server_name, raw_config in mcp_servers.items():
+            provider_key = f"mcp:{server_name}"
+            if provider_key in self._loaded_provider_keys:
+                continue
+            try:
+                server_config = (
+                    raw_config
+                    if isinstance(raw_config, MCPServerConfig)
+                    else MCPServerConfig.model_validate(raw_config)
+                )
+            except Exception:
+                logger.warning("External MCP provider skipped: mcp_config_invalid")
+                continue
+
+            if server_config.command and not _command_is_available(server_config.command):
+                logger.warning("External MCP provider skipped: mcp_command_unavailable")
+                continue
+            if _missing_local_mcp_arg_path(server_config.args) is not None:
+                logger.warning("External MCP provider skipped: mcp_entrypoint_unavailable")
+                continue
+
+            try:
+                provider = MCPToolProvider(
+                    server_name=str(server_name),
+                    server_config=server_config,
+                    redis_instance=None,
+                )
+                provider = await self._stack.enter_async_context(provider)
+                discovered_tools = provider.tools()
+                candidates = [
+                    tool
+                    for tool in discovered_tools
+                    if tool.metadata.action_kind is ToolActionKind.READ
+                    and tool.metadata.capability not in excluded_capabilities
+                ]
+
+                candidate_names = [tool.metadata.name for tool in candidates]
+                has_invalid_name = any(not name for name in candidate_names)
+                has_batch_conflict = len(candidate_names) != len(set(candidate_names))
+                has_existing_conflict = any(
+                    name in self._routing_table or name in self._tool_by_name
+                    for name in candidate_names
+                )
+                if has_invalid_name or has_batch_conflict or has_existing_conflict:
+                    logger.warning("External MCP provider skipped: mcp_name_conflict")
+                    continue
+
+                try:
+                    setattr(provider, "_manager", self)
+                except Exception:
+                    pass
+                for tool in candidates:
+                    name = tool.metadata.name
+                    self._routing_table[name] = provider
+                    self._tools.append(tool)
+                    self._tool_by_name[name] = tool
+                self._providers.append(provider)
+                self._loaded_provider_keys.add(provider_key)
+            except Exception:
+                logger.warning("External MCP provider skipped: mcp_provider_unavailable")
+                continue
         return None
 
     async def _load_support_package_provider(self) -> None:
@@ -522,7 +637,9 @@ class ToolManager:
     def _llm_tool_priority(tool: Tool) -> tuple[int, int, str]:
         provider_name = str(tool.metadata.provider_name or "")
         capability = tool.metadata.capability
-        if provider_name == "target_discovery":
+        if provider_name.startswith("mcp_"):
+            priority = 100
+        elif provider_name == "target_discovery":
             priority = 0
         elif provider_name == "redis_command":
             priority = 1
