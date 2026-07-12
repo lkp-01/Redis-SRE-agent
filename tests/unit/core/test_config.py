@@ -9,10 +9,17 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
-from redis_sre_agent.core.config import DEFAULT_CONFIG_PATHS, MCPServerConfig, Settings
+from redis_sre_agent.core.config import (
+    DEFAULT_CONFIG_PATHS,
+    MCPServerConfig,
+    MCPToolConfig,
+    Settings,
+)
+from redis_sre_agent.tools.models import ToolActionKind, ToolCapability
 
 
 def test_settings_can_be_created_without_real_external_secrets() -> None:
@@ -123,3 +130,108 @@ def test_default_config_paths_are_stable() -> None:
         "sre_agent_config.toml",
         "sre_agent_config.json",
     ]
+
+
+def test_mcp_server_config_accepts_exactly_one_connection_mode() -> None:
+    stdio = MCPServerConfig(command="python", args=["fake_server.py"])
+    streamable = MCPServerConfig(url="https://mcp.example.invalid/v1")
+
+    assert stdio.command == "python"
+    assert stdio.url is None
+    assert stdio.transport in {None, "stdio"}
+    assert streamable.command is None
+    assert streamable.url == "https://mcp.example.invalid/v1"
+    assert streamable.transport == "streamable_http"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"command": "python", "url": "https://mcp.example.invalid/v1"},
+        {"command": "python", "transport": "sse"},
+        {"url": "https://mcp.example.invalid/v1", "transport": "stdio"},
+        {"url": "ftp://mcp.example.invalid/v1", "transport": "streamable_http"},
+    ],
+)
+def test_mcp_server_config_rejects_ambiguous_or_invalid_transports(payload) -> None:
+    with pytest.raises(ValidationError):
+        MCPServerConfig.model_validate(payload)
+
+
+def test_mcp_server_config_requires_opt_in_for_non_loopback_plain_http() -> None:
+    with pytest.raises(ValidationError):
+        MCPServerConfig(
+            url="http://mcp.example.invalid/v1",
+            transport="streamable_http",
+        )
+
+    opted_in = MCPServerConfig(
+        url="http://mcp.example.invalid/v1",
+        transport="streamable_http",
+        allow_insecure_http=True,
+    )
+    loopback = MCPServerConfig(
+        url="http://127.0.0.1:8765/mcp",
+        transport="sse",
+    )
+
+    assert opted_in.allow_insecure_http is True
+    assert loopback.allow_insecure_http is False
+
+
+def test_mcp_tool_allowlist_parses_capability_description_and_action_kind() -> None:
+    config = MCPServerConfig.model_validate(
+        {
+            "command": "python",
+            "tools": {
+                "read_status": {
+                    "capability": "diagnostics",
+                    "description": "读取外部状态。",
+                    "action_kind": "read",
+                }
+            },
+        }
+    )
+
+    assert isinstance(config.tools["read_status"], MCPToolConfig)
+    tool = config.tools["read_status"]
+    assert tool.capability is ToolCapability.DIAGNOSTICS
+    assert tool.description == "读取外部状态。"
+    assert tool.action_kind is ToolActionKind.READ
+
+
+def test_mcp_config_repr_and_validation_errors_do_not_expose_secrets() -> None:
+    sentinel = "MCP_CONFIG_SENTINEL_SECRET"
+    server = MCPServerConfig(
+        url="https://mcp.example.invalid/v1",
+        headers={"Authorization": f"Bearer {sentinel}"},
+        tools={"read_status": MCPToolConfig(action_kind=ToolActionKind.READ)},
+    )
+    settings = Settings(
+        _env_file=None,
+        mcp_servers={
+            "stdio": {
+                "command": "python",
+                "env": {"MCP_TEST_TOKEN": sentinel},
+                "tools": {"read_status": {"action_kind": "read"}},
+            },
+            "remote": server,
+        },
+    )
+
+    assert sentinel not in repr(server)
+    assert sentinel not in repr(settings)
+
+    with pytest.raises(ValidationError) as exc_info:
+        MCPServerConfig.model_validate(
+            {
+                "command": "python",
+                "url": "https://mcp.example.invalid/v1",
+                "env": {"MCP_TEST_TOKEN": sentinel},
+                "headers": {"Authorization": f"Bearer {sentinel}"},
+            }
+        )
+
+    assert sentinel not in str(exc_info.value)
+    assert sentinel not in repr(exc_info.value)

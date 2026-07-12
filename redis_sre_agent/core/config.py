@@ -10,13 +10,15 @@ OpenAI/向量/工具/MCP/target/skill 这些扩展点的配置字段叫什么。
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
+from urllib.parse import urlsplit
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import (
     BaseSettings,
     InitSettingsSource,
@@ -92,6 +94,9 @@ def _build_config_file_source(settings_cls: Type[BaseSettings]) -> PydanticBaseS
 #下面两个专门用来装与MCP工具相关的配置参数
 
 class MCPToolConfig(BaseModel):
+    """受信任配置中对单个远端 MCP 工具的显式约束。"""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     capability: Optional[ToolCapability] = Field(default=None, description="工具能力分类。")
     description: Optional[str] = Field(default=None, description="给上层 Agent 看的工具说明。")
@@ -99,14 +104,76 @@ class MCPToolConfig(BaseModel):
 
 
 class MCPServerConfig(BaseModel):
+    """单个外部 MCP Server 的连接与只读 allowlist 配置。"""
 
-    command: Optional[str] = Field(default=None, description="stdio 方式启动服务的命令。")
-    args: Optional[List[str]] = Field(default=None, description="命令参数。")
-    env: Optional[Dict[str, str]] = Field(default=None, description="服务进程环境变量。")
-    url: Optional[str] = Field(default=None, description="HTTP/SSE 方式的服务地址。")
-    headers: Optional[Dict[str, str]] = Field(default=None, description="HTTP 请求头。")
-    transport: Optional[str] = Field(default=None, description="传输类型插槽。")
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    command: Optional[str] = Field(
+        default=None,
+        repr=False,
+        description="stdio 方式启动服务的命令。",
+    )
+    args: Optional[List[str]] = Field(default=None, repr=False, description="命令参数。")
+    env: Optional[Dict[str, str]] = Field(
+        default=None,
+        repr=False,
+        description="服务进程环境变量。",
+    )
+    url: Optional[str] = Field(
+        default=None,
+        repr=False,
+        description="HTTP/SSE 方式的服务地址。",
+    )
+    headers: Optional[Dict[str, str]] = Field(
+        default=None,
+        repr=False,
+        description="HTTP 请求头。",
+    )
+    transport: Optional[Literal["stdio", "sse", "streamable_http"]] = Field(
+        default=None,
+        description="stdio、SSE 或 Streamable HTTP 传输类型。",
+    )
     tools: Optional[Dict[str, MCPToolConfig]] = Field(default=None, description="工具约束配置。")
+    allow_insecure_http: bool = Field(
+        default=False,
+        description="显式允许非 loopback 的明文 HTTP；默认关闭。",
+    )
+
+    @model_validator(mode="after")
+    def validate_connection_mode(self) -> "MCPServerConfig":
+        """保证连接方式唯一，并在创建 session 前拒绝不安全 URL。"""
+
+        command = self.command.strip() if self.command else None
+        url = self.url.strip() if self.url else None
+        if bool(command) == bool(url):
+            raise ValueError("mcp_connection_mode_invalid")
+
+        self.command = command
+        self.url = url
+        if command:
+            if self.transport not in {None, "stdio"}:
+                raise ValueError("mcp_transport_invalid")
+            self.transport = self.transport or "stdio"
+            return self
+
+        if self.transport not in {None, "sse", "streamable_http"}:
+            raise ValueError("mcp_transport_invalid")
+        self.transport = self.transport or "streamable_http"
+
+        parsed = urlsplit(url or "")
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("mcp_url_invalid")
+        if parsed.scheme == "http" and not self.allow_insecure_http:
+            hostname = parsed.hostname.lower()
+            is_loopback = hostname == "localhost"
+            if not is_loopback:
+                try:
+                    is_loopback = ipaddress.ip_address(hostname).is_loopback
+                except ValueError:
+                    is_loopback = False
+            if not is_loopback:
+                raise ValueError("mcp_insecure_http_blocked")
+        return self
 
 # 下面两个专门用来装系统和外部目标（Target）集成时的配置项
 #假设几个月后，你们公司不用普通的 Redis 了，改用云厂商特供版的 Redis（或者你们想通过 Kubernetes 来管理数据库）。
@@ -165,6 +232,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         env_ignore_empty=True,
+        hide_input_in_errors=True,
     )
 
     app_name: str = Field(default="Redis SRE Agent", description="应用名称。")
@@ -242,7 +310,10 @@ class Settings(BaseSettings):
         ],
         description="阶段三默认只加载 dummy Redis command provider，真实诊断工具在阶段四补齐。",
     )
-    mcp_servers: Dict[str, Union[MCPServerConfig, Dict[str, Any]]] = Field(default_factory=dict)
+    mcp_servers: Dict[str, Union[MCPServerConfig, Dict[str, Any]]] = Field(
+        default_factory=dict,
+        repr=False,
+    )
     skill_roots: List[str] = Field(default_factory=list, description="技能目录插槽。")
     skill_backend_kind: Literal["redis", "custom"] = Field(default="redis")
     skill_backend_class: Optional[str] = Field(default=None)
