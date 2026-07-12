@@ -13,8 +13,25 @@
    Redis provider 的可验证诊断主链。
 6. Stage 8：显式可选的最小 RAG 闭环：本地 Markdown/artifact 摄取、独立 embedding
    配置、RedisVL 向量索引、knowledge search、Chat/Triage 引用回传。
+7. Stage 9：外部 MCP Client 只读切片：受信任配置、stdio/SSE/Streamable HTTP、显式
+   READ allowlist、ToolManager 路由、turn-scoped 清理和本地 fake stdio 集成。
 
-## 当前 Stage 8 范围
+## 当前 Stage 9 范围
+
+Stage 9 不替换 Stage 5/8，而是在同一个 ToolManager 内增加受限的外部只读工具：
+
+```text
+target discovery -> optional knowledge -> external MCP -> target-scoped Redis providers
+```
+
+- `mcp_servers={}` 时不导入或连接 MCP transport，既有行为不变。
+- 只有显式 allowlist 且 `action_kind=read` 的远端工具可注册。
+- 所有调用仍经 `ToolManager.resolve_tool_call()`；名称冲突整组 fail-closed。
+- 内建工具优先于 MCP，MCP 故障只跳过对应 provider。
+- 每轮 Manager 独占并关闭 transport、session、stream 和 stdio 子进程。
+- 没有全局 pool、WRITE/UNKNOWN、审批、OAuth 或 Agent-as-MCP-Server。
+
+Stage 8 的 RAG readiness 与 evidence 链继续保持：
 
 Stage 8 没有替换 Stage 5，而是在其旁边增加受 readiness 门控的 knowledge 路径：
 
@@ -44,7 +61,8 @@ RAG ready
 - HybridQuery、RRF、reranker、完整全文/精确短语检索。
 - 独立 Knowledge Agent、Agent 可调用的 ingest、knowledge management/pack。
 - skills、support tickets、网页/PDF/Notebook/Cloud ingestion。
-- MCP 完整生态、support package 解压和离线分析。
+- MCP 全局 pool、write approval、OAuth、Agent-as-MCP-Server，以及 support package 解压
+  和离线分析。
 - API、worker、scheduler、OpenTelemetry、完整 evaluation suite、UI。
 
-这些能力继续保留 original 风格的边界，不在 Stage 8 提前实现。
+这些能力继续保留 original 风格的边界，不在 Stage 9 提前实现。

@@ -1,10 +1,28 @@
-# 当前阶段：Stage 8
+# 当前阶段：Stage 9
 
 ## 结论
 
-Stage 8 已在现有 Stage 5 诊断主链上接入“本地 Markdown → embedding → Redis Vector
-Search → ToolManager knowledge search → Agent 顶层引用”的最小闭环。RAG 默认关闭，
-普通诊断不因此增加 Redis Search 或 embedding 依赖。
+Stage 9 已在现有 Stage 5 诊断主链和 Stage 8 可选 RAG 旁边接入外部 MCP Client
+只读切片。MCP 与 RAG 均为显式可选能力；未配置或不可用时，普通 Redis 诊断不增加
+外部连接依赖，也不改变 Chat/Triage StateGraph、Thread、router 或 target binding。
+
+## MCP Client 主链
+
+```text
+trusted Settings
+-> MCPServerConfig validation
+-> turn-scoped MCPToolProvider
+-> ToolManager atomic registration
+-> existing Agent tool loop
+-> ToolMessage / top-level ResultEnvelope
+```
+
+- command/url 必须二选一；URL 默认 HTTPS，非 loopback HTTP 需要显式风险开关。
+- `tools` allowlist 和 `action_kind=read` 都是必需条件；WRITE/UNKNOWN 不可见、不可调用。
+- MCP 名称冲突不会覆盖 target、Redis、knowledge 或其他 MCP 工具。
+- Manager 工具上限优先保留全部内建工具，再裁剪 MCP。
+- MCP initialize/list/call/close 有超时；错误只返回稳定、脱敏 reason code。
+- 当前连接按 Agent turn 创建和关闭，没有全局 pool、后台 task 或永久 MCP cache。
 
 ## RAG 状态与索引责任
 
@@ -48,6 +66,9 @@ source_documents/**/*.md
 
 2026-07-12 本机检查结果：
 
+- MCP SDK 解析为安装范围内的 1.28.1；本地 fake stdio 已完成真实
+  initialize/list/call/close 协议验证，并确认子进程退出。
+- SSE 与 Streamable HTTP 使用 transport mock 验证；未访问公网 MCP Server。
 - 宿主 Redis 可连接，但 `MODULE LIST` 没有 Search，`FT._LIST` 不可用。
 - Docker CLI 已安装，但 Docker service/daemon 未运行；没有本地 Redis Stack/Podman binary。
 - 没有独立 embedding key，chat key 未被复用。
@@ -57,6 +78,7 @@ source_documents/**/*.md
 ## 有意保留的裁剪
 
 - 不新增 Knowledge Agent，不把 ingest 暴露给 LLM。
+- 不恢复 MCPConnectionPool、WRITE/UNKNOWN/审批、OAuth 或 Agent-as-MCP-Server。
 - 不恢复 skills、support tickets、knowledge pack、网页抓取和多索引 pipeline。
 - 不恢复 Hybrid/RRF/reranker、API、worker、scheduler、完整 eval 或 UI。
 - Chat/Triage 主 StateGraph、ToolManager 路由、target binding、Redis diagnostics 与

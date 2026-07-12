@@ -1,8 +1,8 @@
 # Redis SRE Agent 诊断切片
 
 这是 `original-redis-sre-agent-main` 的裁剪复刻项目。Stage 8 在既有 Stage 5
-诊断主链上恢复了可选的最小 RAG 闭环，同时保留 original 的文件边界、ToolManager
-路由和 StateGraph 控制流。
+诊断主链上恢复了可选的最小 RAG 闭环；Stage 9 又接入受信任配置中的外部 MCP Client
+只读切片。两者都保留 original 的文件边界、ToolManager 路由和 StateGraph 控制流。
 
 ```text
 本地 Markdown
@@ -23,6 +23,23 @@ Click LazyGroup -> cli/query.py -> Redis Thread -> router
 -> ToolManager -> target discovery / RedisCommandToolProvider
 -> ResultEnvelope -> assistant response / message trace
 ```
+
+## 外部 MCP Client
+
+Stage 9 只允许配置 allowlist 中显式 `action_kind: read` 的 MCP 工具。stdio、SSE 和
+Streamable HTTP transport 都由当前轮 `ToolManager` 独占；每轮退出时关闭 session、stream
+和 stdio 子进程。MCP 未配置或连接失败不会阻断 target discovery、Redis diagnostics 或
+可选 knowledge 工具。
+
+```text
+trusted Settings -> MCPServerConfig -> MCPToolProvider
+-> ToolManager.resolve_tool_call()
+-> ToolMessage -> ResultEnvelope
+```
+
+配置示例、安全边界、稳定错误码和当前不支持项见
+[Stage 9 MCP Client 说明](docs/codex/MCP_CLIENT.md)。本阶段不支持 WRITE/UNKNOWN 工具、
+全局连接池、OAuth、Agent-as-MCP-Server，也没有引入 `langchain-mcp-adapters`。
 
 ## RAG 三态
 
@@ -132,7 +149,8 @@ python -m pytest -q
 git diff --check
 ```
 
-默认测试使用 fake LLM、fake vectorizer、fake transactional Redis/index，不访问外部模型。
+默认测试使用 fake LLM、fake vectorizer、fake transactional Redis/index 和本地 fake
+stdio MCP server，不访问外部模型或公网 MCP Server。
 真实 Redis Stack 集成必须显式指向隔离环境：
 
 ```powershell
@@ -148,6 +166,6 @@ python -m pytest -o addopts="" -q -m integration tests/integration/test_rag_redi
 ## 有意保留的插槽
 
 本阶段不恢复独立 Knowledge Agent、LLM ingest 工具、Hybrid/RRF/reranker、skills、
-support tickets、knowledge pack、网页/PDF ingestion、API、worker、scheduler、完整 eval、
-OpenTelemetry 或 UI。Click `LazyGroup`、Chat/Triage StateGraph、Thread 持久化、target
-binding 和 Redis 只读诊断行为保持既有边界。
+support tickets、knowledge pack、网页/PDF ingestion、MCP pool/write approval/server、
+API、worker、scheduler、完整 eval、OpenTelemetry 或 UI。Click `LazyGroup`、Chat/Triage
+StateGraph、Thread 持久化、target binding 和 Redis 只读诊断行为保持既有边界。

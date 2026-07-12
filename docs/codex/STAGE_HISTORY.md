@@ -1,5 +1,61 @@
 # Stage History
 
+## 2026-07-12 Stage 9 external MCP client read-only slice
+
+### 完成内容
+
+- 增加 `mcp>=1.23.3,<2.0.0` 唯一新依赖，以及 command/url、transport、URL scheme、
+  non-loopback HTTP 风险开关和配置错误脱敏校验。
+- 新增 turn-scoped `MCPToolProvider`，支持 stdio、SSE 和 Streamable HTTP；只传最小
+  子进程环境，并为 initialize/list/call/close 设置超时。
+- 只有显式 allowlist 且 `action_kind=read` 的工具可见；WRITE/UNKNOWN 在 Provider 和
+  ToolManager 两层均被拒绝。
+- 远端名称、description、schema 和结果按不可信输入处理；名称确定化、冲突整组
+  fail-closed，description/schema/result 有固定上限，二进制只回传类型计数。
+- ToolManager 保持 target discovery → optional knowledge → MCP → target Redis provider
+  顺序，MCP 调用继续走 `resolve_tool_call()`，失败不阻断内建诊断。
+- Chat/Triage fake LLM 覆盖 MCP→Redis、MCP error→Redis success，以及
+  MCP→target discovery→动态 Redis provider 重绑定；两类 evidence 都进入顶层 envelope。
+- 本地 FastMCP stdio 子进程完成真实 initialize/list/call/timeout/close，测试按 PID 确认
+  Manager 退出后没有残留进程。
+- 对抗性审查补充取消路径清理与 Manager fallback 脱敏：取消信号仍向上传播，但已进入的
+  MCP transport/session 先关闭；兜底日志不记录 tool args、异常原文或 traceback。
+
+### 从 original 复制或最小适配
+
+- `core/config.py`：保留 `MCPToolConfig`、`MCPServerConfig` 和字段名，增加首期安全 validator。
+- `tools/mcp/provider.py`：保留 `MCPToolProvider(ToolProvider)`、schema coercion、
+  async context、三种 transport、discovery/schema/tool/call 方法边界；删除 pool 和 eval override。
+- `tools/manager.py`：复制并适配 `_command_is_available()`、
+  `_missing_local_mcp_arg_path()`、`_load_mcp_providers()` 和 LLM tool priority 形状。
+- Agent helpers/tool execution 已能承载 MCP schema、ToolMessage 和 ResultEnvelope，因此只加
+  回归测试，没有改动 Chat/Triage 图或生产 Agent 文件。
+
+### 有意不复制
+
+- 全局 `MCPConnectionPool`、API lifespan、worker/scheduler 后台生命周期。
+- Agent-as-MCP-Server、MCP CLI/server package。
+- WRITE/UNKNOWN 工具、人工审批、中断恢复、OAuth/token refresh。
+- evaluation runtime override、动态 catalog refresh、后台健康检查和自动重连。
+- `langchain-mcp-adapters`、第二套工具路由、图片/音频/二进制正文注入 LLM。
+
+### 阶段验证
+
+- 配置 focused：14 passed；Provider focused：15 passed。
+- Manager focused：14 passed；Agent focused：30 passed。
+- 本地真实 stdio integration：3 passed，包含 timeout 和进程关闭检查。
+- `python -m pip install -e .`：通过，解析 `mcp 1.28.1`。
+- `python -m compileall redis_sre_agent tests`：通过。
+- 全量：188 passed，3 skipped，1 个既有 Click `MultiCommand` deprecation warning。
+- 3 个 skip：2 个显式 DeepSeek live tests，1 个显式 Redis Stack RAG integration。
+- `git diff --check`：通过；URL transport 仅做 mock，不访问公网。
+
+### 已知差异
+
+- 当前按 Agent turn 重新连接和发现工具，不提供 original 的进程级连接复用。
+- SSE/Streamable HTTP 没有真实远端 smoke；本阶段只验证 SDK transport 分支和安全配置。
+- 不信任 server annotations 推断读写，部署者必须在本地受信任配置中显式标记 READ。
+
 ## 2026-07-12 Stage 8 minimum RAG closed loop
 
 ### 完成内容
