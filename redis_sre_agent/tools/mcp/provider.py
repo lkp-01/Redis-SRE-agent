@@ -264,6 +264,9 @@ class MCPToolProvider(ToolProvider):
             self._session = await self._enter_async_context(session)
             await self.initialize()
             await self.list_tools()
+        except asyncio.CancelledError:
+            await self._close_owned_stack()
+            raise
         except MCPProviderError as exc:
             code = str(exc)
             await self._close_owned_stack()

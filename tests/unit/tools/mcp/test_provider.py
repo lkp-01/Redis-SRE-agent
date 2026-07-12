@@ -543,3 +543,46 @@ async def test_discovery_failure_closes_transport_and_redacts_exception(monkeypa
     assert provider._session is None
     assert sentinel not in caplog.text
     assert sentinel not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_initialize_closes_owned_transport_before_propagating(
+    monkeypatch,
+) -> None:
+    provider_module = importlib.import_module("redis_sre_agent.tools.mcp.provider")
+    exited = False
+    sessions: list[FakeSession] = []
+
+    @asynccontextmanager
+    async def fake_stdio(_params, errlog=None):
+        nonlocal exited
+        try:
+            yield "read", "write"
+        finally:
+            exited = True
+
+    class CancelledSession(FakeSession):
+        async def initialize(self):
+            raise asyncio.CancelledError()
+
+    def fake_client_session(read_stream, write_stream):
+        session = CancelledSession(read_stream, write_stream)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(provider_module, "stdio_client", fake_stdio)
+    monkeypatch.setattr(provider_module, "ClientSession", fake_client_session)
+    provider = provider_module.MCPToolProvider(
+        server_name="cancelled-connect",
+        server_config=MCPServerConfig(
+            command="fake-mcp-command",
+            tools={"read_status": MCPToolConfig(action_kind=ToolActionKind.READ)},
+        ),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await provider._connect()
+
+    assert exited is True
+    assert sessions and sessions[0].closed is True
+    assert provider._session is None

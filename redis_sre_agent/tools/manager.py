@@ -560,6 +560,7 @@ class ToolManager:
     async def execute_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Any]:
         results: List[Any] = []
         for tool_call in tool_calls or []:
+            name = ""
             try:
                 name = tool_call.get("name")
                 if not name and isinstance(tool_call.get("function"), dict):
@@ -581,8 +582,13 @@ class ToolManager:
                     continue
                 results.append(await self.resolve_tool_call(name, args))
             except Exception as exc:
-                logger.exception("Tool call execution failed for %s", tool_call)
-                results.append({"status": "failed", "error": _safe_error_message(exc)})
+                logger.warning("Tool call execution failed: tool_execution_failed")
+                error = (
+                    "mcp_tool_error"
+                    if str(name or "").startswith("mcp_")
+                    else _safe_error_message(exc)
+                )
+                results.append({"status": "failed", "error": error})
         return results
 
     async def resolve_tool_call(

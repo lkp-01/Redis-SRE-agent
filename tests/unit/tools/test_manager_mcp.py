@@ -414,3 +414,30 @@ async def test_manager_registers_only_read_mcp_tools_and_applies_category_filter
         filtered_names = [tool.name for tool in filtered_manager.get_tools_for_llm()]
 
     assert read_name not in filtered_names
+
+
+@pytest.mark.asyncio
+async def test_manager_mcp_fallback_never_logs_or_returns_tool_arguments(
+    monkeypatch,
+    caplog,
+) -> None:
+    sentinel = "MCP_TOOL_ARGUMENT_SENTINEL_SECRET"
+
+    async with ToolManager() as manager:
+        async def failing_resolve(_tool_name, _args):
+            raise RuntimeError(f"unexpected remote failure {sentinel}")
+
+        monkeypatch.setattr(manager, "resolve_tool_call", failing_resolve)
+        result = await manager.execute_tool_calls(
+            [
+                {
+                    "name": "mcp_external_a1b2c3_read_status",
+                    "args": {"opaque_argument": sentinel},
+                }
+            ]
+        )
+
+    assert result == [{"status": "failed", "error": "mcp_tool_error"}]
+    assert sentinel not in caplog.text
+    assert "opaque_argument" not in caplog.text
+    assert "Traceback" not in caplog.text
