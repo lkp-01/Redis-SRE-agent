@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from mcp import types as mcp_types
 from pydantic import SecretStr
 from langgraph.graph import StateGraph
 
@@ -20,6 +22,7 @@ from redis_sre_agent.core.config import Settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
+from redis_sre_agent.tools.mcp.provider import MCPToolProvider
 
 _PASSWORD = "stage5-chat-password"
 _TOKEN = "stage5-chat-token"
@@ -75,6 +78,59 @@ class KnowledgeSearchLLM:
                     "args": {"query": "redis latency"},
                 }
             ],
+        )
+
+
+class MCPThenRedisChatLLM:
+    def __init__(self) -> None:
+        self.tools: list[Any] = []
+        self.bound_snapshots: list[set[str]] = []
+
+    def bind_tools(self, tools: list[Any]) -> "MCPThenRedisChatLLM":
+        self.tools = list(tools)
+        self.bound_snapshots.append({tool.name for tool in self.tools})
+        return self
+
+    async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
+        if not tool_messages:
+            mcp_tool = next(tool for tool in self.tools if tool.name.startswith("mcp_"))
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "chat_mcp_read",
+                        "name": mcp_tool.name,
+                        "args": {"detail": True},
+                    }
+                ],
+            )
+        if len(tool_messages) == 1:
+            info_tool = next(tool for tool in self.tools if tool.name.endswith("info"))
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "chat_redis_info",
+                        "name": info_tool.name,
+                        "args": {"section": "memory"},
+                    }
+                ],
+            )
+        return AIMessage(content="MCP and Redis evidence collected")
+
+
+class FakeAgentMCPSession:
+    def __init__(self, *, is_error: bool = False) -> None:
+        self.is_error = is_error
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_tool(self, name: str, arguments=None):
+        self.calls.append((name, dict(arguments or {})))
+        return mcp_types.CallToolResult(
+            isError=self.is_error,
+            content=[mcp_types.TextContent(type="text", text="fake external status")],
+            structuredContent={"external_status": "healthy"} if not self.is_error else None,
         )
 
 
@@ -228,6 +284,74 @@ async def test_chat_returns_llm_final_text_after_tool_loop(monkeypatch) -> None:
     assert response.response == "FAKE_LLM_FINAL_ANSWER"
     assert response.tool_envelopes
     assert "Redis 诊断摘要" not in response.response
+
+
+@pytest.mark.asyncio
+async def test_chat_executes_mcp_then_redis_and_keeps_both_top_level_envelopes(
+    monkeypatch,
+) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+
+    sessions: list[FakeAgentMCPSession] = []
+
+    async def fake_mcp_connect(self) -> None:
+        session = FakeAgentMCPSession()
+        sessions.append(session)
+        self._session = session
+        self._mcp_tools = [
+            mcp_types.Tool(
+                name="read_status",
+                description="Read fake external status.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"detail": {"type": "boolean"}},
+                },
+            )
+        ]
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeChatRedisClient()
+        return self._client
+
+    monkeypatch.setattr(MCPToolProvider, "_connect", fake_mcp_connect)
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        manager_module,
+        "settings",
+        Settings(
+            _env_file=None,
+            rag_enabled=False,
+            mcp_servers={
+                "agent_fake": {
+                    "command": sys.executable,
+                    "tools": {
+                        "read_status": {
+                            "capability": "diagnostics",
+                            "action_kind": "read",
+                        }
+                    },
+                }
+            },
+        ),
+    )
+    llm = MCPThenRedisChatLLM()
+    response = await ChatAgent(
+        redis_instance=make_instance(),
+        llm=llm,
+    ).process_query(
+        "check external and redis status",
+        session_id="session-chat-mcp",
+        user_id=None,
+        context={"thread_id": "thread-chat-mcp"},
+    )
+
+    by_name = {envelope["name"]: envelope for envelope in response.tool_envelopes}
+    assert response.response == "MCP and Redis evidence collected"
+    assert by_name["read_status"]["status"] == "success"
+    assert by_name["info"]["status"] == "success"
+    assert sessions and sessions[0].calls == [("read_status", {"detail": True})]
+    assert any(any(name.startswith("mcp_") for name in snapshot) for snapshot in llm.bound_snapshots)
 
 
 @pytest.mark.asyncio

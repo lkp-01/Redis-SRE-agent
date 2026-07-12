@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from redis_sre_agent.agent.helpers import build_result_envelope, coerce_response_text, extract_citations
+import pytest
+
+from redis_sre_agent.agent.helpers import (
+    build_adapters_for_tooldefs,
+    build_result_envelope,
+    coerce_response_text,
+    extract_citations,
+)
 from redis_sre_agent.agent.models import AgentResponse
 from redis_sre_agent.tools.models import ToolCapability, ToolDefinition
 
@@ -166,3 +173,57 @@ def test_agent_response_derives_search_results_from_knowledge_envelopes() -> Non
 
 def test_coerce_response_text_handles_list_content() -> None:
     assert coerce_response_text([{"text": " hello "}, "world"]) == "hello\nworld"
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_schema_round_trips_through_langchain_adapter() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class RecordingManager:
+        async def resolve_tool_call(self, name: str, args: dict):
+            calls.append((name, dict(args)))
+            return {"status": "success", "echo": dict(args)}
+
+    tool = ToolDefinition(
+        name="mcp_schema_a1b2c3_read_status",
+        description="Read external status.",
+        capability=ToolCapability.DIAGNOSTICS,
+        parameters={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "count": {"type": "integer"},
+                "ratio": {"type": "number"},
+                "enabled": {"type": "boolean"},
+                "note": {"type": ["string", "null"]},
+                "opaque": {"description": "Optional provider-defined value."},
+            },
+            "required": ["text", "count", "ratio", "enabled"],
+        },
+    )
+
+    adapters = await build_adapters_for_tooldefs(RecordingManager(), [tool])
+    assert len(adapters) == 1
+    adapter = adapters[0]
+    schema = adapter.args_schema.model_json_schema()
+    values = {
+        "text": "ok",
+        "count": 2,
+        "ratio": 0.5,
+        "enabled": True,
+        "note": None,
+        "opaque": {"provider": "value"},
+    }
+
+    result = await adapter.ainvoke(values)
+
+    assert schema["properties"]["text"]["type"] == "string"
+    assert schema["properties"]["count"]["type"] == "integer"
+    assert schema["properties"]["ratio"]["type"] == "number"
+    assert schema["properties"]["enabled"]["type"] == "boolean"
+    assert {item.get("type") for item in schema["properties"]["note"]["anyOf"]} == {
+        "string",
+        "null",
+    }
+    assert result == {"status": "success", "echo": values}
+    assert calls == [(tool.name, values)]

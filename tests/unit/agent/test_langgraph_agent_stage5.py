@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from mcp import types as mcp_types
 from pydantic import SecretStr
 from langgraph.graph import StateGraph
 
@@ -27,6 +28,7 @@ from redis_sre_agent.core.config import Settings
 from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.tools.diagnostics.redis_command.provider import RedisCommandToolProvider
 from redis_sre_agent.tools.manager import ToolManager
+from redis_sre_agent.tools.mcp.provider import MCPToolProvider
 
 _PASSWORD = "stage5-triage-password"
 _URL = f"redis://default:{_PASSWORD}@cache.internal:6379/0"
@@ -137,6 +139,56 @@ class KnowledgeTriagePipelineLLM(TriagePipelineLLM):
                 ],
             )
         return await super().ainvoke(messages)
+
+
+class MCPThenRedisTriageLLM(TriagePipelineLLM):
+    async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        system_text = "\n".join(
+            str(message.content) for message in messages if isinstance(message, SystemMessage)
+        )
+        if "careful technical editor" in system_text or (
+            "research and then synthesize recommendations" in system_text
+        ):
+            return await super().ainvoke(messages)
+
+        tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
+        if not tool_messages:
+            mcp_tool = next(tool for tool in self.tools if tool.name.startswith("mcp_"))
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "triage_mcp_read",
+                        "name": mcp_tool.name,
+                        "args": {"detail": True},
+                    }
+                ],
+            )
+        if len(tool_messages) == 1:
+            info_tool = next(tool for tool in self.tools if tool.name.endswith("info"))
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "triage_redis_info",
+                        "name": info_tool.name,
+                        "args": {"section": "memory"},
+                    }
+                ],
+            )
+        return AIMessage(content="Initial evidence assessment")
+
+
+class FailingAgentMCPSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_tool(self, name: str, arguments=None):
+        self.calls.append((name, dict(arguments or {})))
+        return mcp_types.CallToolResult(
+            isError=True,
+            content=[mcp_types.TextContent(type="text", text="untrusted remote failure")],
+        )
 
 
 class FakeTriageRedisClient:
@@ -300,6 +352,77 @@ async def test_triage_runs_topics_recommendation_and_composer(monkeypatch) -> No
     assert llm.stages == ["topics", "recommendation", "composer"]
     assert llm.structured_methods == ["function_calling", "function_calling"]
     assert "Redis 深度诊断报告" not in response.response
+
+
+@pytest.mark.asyncio
+async def test_triage_keeps_mcp_error_and_redis_success_as_distinct_top_level_evidence(
+    monkeypatch,
+) -> None:
+    import redis_sre_agent.tools.manager as manager_module
+
+    sessions: list[FailingAgentMCPSession] = []
+
+    async def fake_mcp_connect(self) -> None:
+        session = FailingAgentMCPSession()
+        sessions.append(session)
+        self._session = session
+        self._mcp_tools = [
+            mcp_types.Tool(
+                name="read_status",
+                description="Read fake external status.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"detail": {"type": "boolean"}},
+                },
+            )
+        ]
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeTriageRedisClient()
+        return self._client
+
+    monkeypatch.setattr(MCPToolProvider, "_connect", fake_mcp_connect)
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        manager_module,
+        "settings",
+        Settings(
+            _env_file=None,
+            rag_enabled=False,
+            mcp_servers={
+                "triage_fake": {
+                    "command": sys.executable,
+                    "tools": {
+                        "read_status": {
+                            "capability": "diagnostics",
+                            "action_kind": "read",
+                        }
+                    },
+                }
+            },
+        ),
+    )
+    llm = MCPThenRedisTriageLLM()
+    response = await SRELangGraphAgent(
+        redis_instance=make_instance(),
+        llm=llm,
+    ).process_query(
+        "triage external and redis status",
+        session_id="session-triage-mcp",
+        user_id=None,
+        context={"thread_id": "thread-triage-mcp"},
+    )
+
+    by_name = {envelope["name"]: envelope for envelope in response.tool_envelopes}
+    assert by_name["read_status"]["status"] == "error"
+    assert by_name["read_status"]["data"] == {
+        "status": "error",
+        "error": "mcp_tool_error",
+    }
+    assert by_name["info"]["status"] == "success"
+    assert sessions and sessions[0].calls == [("read_status", {"detail": True})]
+    assert response.response.startswith("## Initial Assessment")
 
 
 @pytest.mark.asyncio
