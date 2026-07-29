@@ -1,0 +1,43 @@
+# 本地诊断环境使用单进程 Loki，并把索引和日志块保存在 Docker volume 中。
+# 这里不启用认证，因此 3100 端口只能绑定到宿主机回环地址。
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  volume_enabled: true
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+
+# 后续 Loki provider 的 patterns 工具依赖该组件。
+pattern_ingester:
+  enabled: true
+
+analytics:
+  reporting_enabled: false

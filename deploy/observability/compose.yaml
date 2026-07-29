@@ -1,0 +1,177 @@
+name: redis-sre-observability
+
+services:
+  redis-primary:
+    image: redis:7.4
+    container_name: redis-sre-primary
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - noeviction
+      - --slowlog-log-slower-than
+      - "1000"
+      - --slowlog-max-len
+      - "128"
+    ports:
+      - "127.0.0.1:17379:6379"
+    volumes:
+      - redis_primary_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+  redis-replica1:
+    image: redis:7.4
+    container_name: redis-sre-replica1
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --replicaof
+      - redis-sre-primary
+      - "6379"
+      - --replica-read-only
+      - "yes"
+      - --slowlog-log-slower-than
+      - "1000"
+      - --slowlog-max-len
+      - "128"
+    ports:
+      - "127.0.0.1:17380:6379"
+    volumes:
+      - redis_replica1_data:/data
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+  redis-replica2:
+    image: redis:7.4
+    container_name: redis-sre-replica2
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --replicaof
+      - redis-sre-primary
+      - "6379"
+      - --replica-read-only
+      - "yes"
+      - --slowlog-log-slower-than
+      - "1000"
+      - --slowlog-max-len
+      - "128"
+    ports:
+      - "127.0.0.1:17381:6379"
+    volumes:
+      - redis_replica2_data:/data
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.88.0
+    container_name: redis-sre-exporter
+    environment:
+      REDIS_EXPORTER_LOG_FORMAT: txt
+    ports:
+      - "127.0.0.1:9121:9121"
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    container_name: redis-sre-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:19090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - redis-exporter
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+  loki:
+    image: grafana/loki:3.7.0
+    container_name: redis-sre-loki
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+  alloy:
+    image: grafana/alloy:v1.18.0
+    container_name: redis-sre-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      - ./alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - redis-lab
+
+networks:
+  redis-lab:
+    external: true
+    name: redis-sre-lab-net
+
+volumes:
+  redis_primary_data:
+    name: redis-sre-primary-data
+  redis_replica1_data:
+    name: redis-sre-replica1-data
+  redis_replica2_data:
+    name: redis-sre-replica2-data
+  prometheus_data:
+    name: redis-sre-prometheus-data
+  loki_data:
+    name: redis-sre-loki-data
+  alloy_data:
+    name: redis-sre-alloy-data

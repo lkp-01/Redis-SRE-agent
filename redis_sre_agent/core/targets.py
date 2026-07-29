@@ -88,10 +88,23 @@ class TargetCatalogDoc(BaseModel):
 
 class ThreadTargetState(BaseModel):
     """线程 target 状态的阶段三兼容插槽。"""
+    # 继承自 Pydantic 的 BaseModel，用于对当前交互线程（Thread）中所绑定的 Redis Target 状态进行数据校验和管理。
 
+    # 已附着到当前线程的所有 Target 唯一标识（Handle）列表，默认为空列表。
+    # 用于快速记录和排查该会话线程一共关联了哪些 Redis 实例或集群。
     attached_target_handles: List[str] = Field(default_factory=list)
+
+    # 当前处于激活（选中）状态的 Target 唯一标识。
+    # 当 Agent 收到具体指令时，会优先对这个 active 标识指向的 Redis Target 执行操作；若未指定则为 None。
     active_target_handle: Optional[str] = None
+
+    # Target 工具集（Toolset）的版本/世代计数器，默认为 0。
+    # 每次动态绑定、解绑或更新 Target 时，该版本号会递增。
+    # 供 ToolManager 识别工具集是否发生变更，以此来决定是否需要刷新动态生成的工具列表。
     target_toolset_generation: int = 0
+
+    # 包含完整公共元数据的 Target 绑定详情（TargetBinding）列表，默认为空列表。
+    # 内部详细记录了每个被绑定 Target 的类型、所处环境、拥有的 Capabilities（如 metrics, logs）等不含敏感信息的公开元数据。
     target_bindings: List[TargetBinding] = Field(default_factory=list)
 
 
@@ -693,35 +706,58 @@ async def attach_target_matches(
     )
     return materialized.attached_bindings, materialized.target_toolset_generation
 
-
+# 持久化并激活target，然后更新到前端thread里
 async def materialize_bound_target_scope(
-    *,
-    matches: Sequence[DiscoveryCandidate],
-    thread_id: Optional[str] = None,
-    task_id: Optional[str] = None,
-    replace_existing: bool = False,
-) -> MaterializedTargetScope:
+        *,
+        matches: Sequence[DiscoveryCandidate],  # 输入参数：一组通过匹配（Discovery）筛选出来的目标候选人对象
+        thread_id: Optional[str] = None,  # 输入参数：可选的当前聊天线程（Thread）ID
+        task_id: Optional[str] = None,  # 输入参数：可选的当前异步任务（Task）ID
+        replace_existing: bool = False,  # 输入参数：是否替换现有的绑定，布尔值（在此函数体中暂未直接显式用到，可能透传或留作扩展）
+) -> MaterializedTargetScope:  # 返回值类型：具象化后的目标作用域模型对象
+
+    # 1. 实例化目标绑定服务。该服务负责将抽象的“匹配候选人”持久化或转化为底层的“公共/具体绑定记录”
     binding_service = TargetBindingService()
+
+    # 2. 调用绑定服务，将匹配到的目标候选人（matches）在数据库/持久层中构建并存储。
+    #    这里会关联当前的 thread_id 和 task_id，以便追踪这些 Redis 目标具体绑定到了哪个上下文。
     selected_bindings = await binding_service.build_and_persist_records(
         matches,
         thread_id=thread_id,
         task_id=task_id,
     )
+
+    # 3. 将返回的绑定结果强制转换为标准的 Python 列表（List）结构，作为后续附着（attach）的基准
     attached_bindings = list(selected_bindings)
+
+    # 4. 计算当前工具集的版本/世代（Generation）。如果有成功生成的绑定记录，则代际设为 1，否则设为 0。
+    #    这用于告诉 Agent 或 ToolManager 绑定的工具集发生了变更，需要刷新工具列表
     generation = 1 if selected_bindings else 0
+
+    # 5. 确定当前处于激活状态的目标句柄（Handle）。默认将生成的第一个绑定记录的句柄作为当前处于 Active 状态的目标
     active_handle = selected_bindings[0].target_handle if selected_bindings else None
+
+    # 6. 调用辅助函数，根据上面算出的绑定列表、代际和激活句柄，组装成一个用于更新上下文的字典（Dict）
+    #    这里面会包含诸如 "attached_target_handles"、"active_target_handle" 等标准的阶段三上下文槽位
     context_updates = build_bound_target_scope_context(
         attached_bindings,
         generation=generation,
         active_handle=active_handle,
     )
+
+    # 7. 如果传了 thread_id，说明当前处于一个具体的聊天/会话线程中
     if thread_id:
         try:
+            # 8. 动态引入线程管理器 ThreadManager，避免循环引用
             from redis_sre_agent.core.threads import ThreadManager
 
+            # 9. 将刚刚组装好的 `context_updates` 上下文槽位数据，异步写入/持久化到该线程的 Context 中
             await ThreadManager().update_thread_context(thread_id, context_updates)
         except Exception:
+            # 如果线程上下文更新失败（比如中间件挂了或线程不存在），优雅降级，捕获异常不中断主流程
             pass
+
+    # 10. 最终返回一个封装好的 MaterializedTargetScope 领域模型，
+    #     包含：选择的绑定、附着的绑定、工具集代际数以及上下文更新字典
     return MaterializedTargetScope(
         selected_bindings=list(selected_bindings),
         attached_bindings=attached_bindings,

@@ -306,9 +306,11 @@ class Settings(BaseSettings):
 
     tool_providers: List[str] = Field(
         default_factory=lambda: [
-            "redis_sre_agent.tools.diagnostics.redis_command.provider.RedisCommandToolProvider"
+            "redis_sre_agent.tools.diagnostics.redis_command.provider.RedisCommandToolProvider",
+            "redis_sre_agent.tools.metrics.prometheus.provider.PrometheusToolProvider",
+            "redis_sre_agent.tools.logs.loki.provider.LokiToolProvider",
         ],
-        description="阶段三默认只加载 dummy Redis command provider，真实诊断工具在阶段四补齐。",
+        description="绑定 Redis target 后按顺序加载的只读诊断、指标和日志 provider。",
     )
     mcp_servers: Dict[str, Union[MCPServerConfig, Dict[str, Any]]] = Field(
         default_factory=dict,

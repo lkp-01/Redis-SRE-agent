@@ -24,6 +24,43 @@ Click LazyGroup -> cli/query.py -> Redis Thread -> router
 -> ResultEnvelope -> assistant response / message trace
 ```
 
+## Redis 目标的可观测性工具
+
+绑定一个 Redis target 后，ToolManager 按固定顺序注册三类只读 provider：
+
+| Provider | 工具数 | 用途 |
+| --- | ---: | --- |
+| Redis Command | 11 | 直接读取 Redis INFO、慢日志、客户端、内存和拓扑等证据 |
+| Prometheus | 3 | 查询当前指标、范围指标和可用指标名 |
+| Loki | 7 | 查询日志、标签、日志流、容量和日志模式 |
+
+每个目标合计 21 个工具。Provider 构造和 Agent 启动不会主动连接 Prometheus 或 Loki，
+只有实际调用相应工具时才发出请求。未配置外部服务时，Redis Command 诊断仍可运行；
+Prometheus 或 Loki 调用会返回局部、脱敏的结构化连接错误。
+
+Agent 不负责安装、启动或停止 Prometheus、Loki 和日志采集器。仓库中的
+[`deploy/observability`](deploy/observability/README.md) 只是人工启动的本地开发夹具：
+Prometheus 必须先通过 Redis exporter 抓到指标，Loki 必须先通过 Alloy 收到 Redis 日志。
+当前 Alloy 写入稳定标签 `job="redis"`、`service`、`instance` 和 `redis_role`。
+
+```powershell
+docker compose -f deploy/observability/compose.yaml up -d
+
+$env:RUN_PROMETHEUS_INTEGRATION = "1"
+$env:TOOLS_PROMETHEUS_URL = "http://127.0.0.1:19090"
+python -m pytest -o addopts="" -q -m integration tests/integration/tools/metrics
+
+$env:NO_PROXY = "127.0.0.1,localhost"
+$env:RUN_LOKI_INTEGRATION = "1"
+$env:TOOLS_LOKI_URL = "http://127.0.0.1:3100"
+$env:TOOLS_LOKI_DEFAULT_SELECTOR = '{job="redis"}'
+python -m pytest -o addopts="" -q -m integration tests/integration/tools/logs
+```
+
+本切片不包含 Host Telemetry、Support Package、Redis Cloud、Redis Enterprise Admin、
+Prometheus/Loki 写入、认证扩展、Grafana dashboard 或告警。真实 URL、tenant、token、
+Redis 密码和连接串不得写入测试快照、日志或提交记录。
+
 ## 外部 MCP Client
 
 Stage 9 只允许配置 allowlist 中显式 `action_kind: read` 的 MCP 工具。stdio、SSE 和

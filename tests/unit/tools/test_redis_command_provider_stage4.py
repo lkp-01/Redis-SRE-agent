@@ -23,6 +23,19 @@ _CONFIG_SECRET = "stage4-config-secret"
 _SLOWLOG_SECRET = "stage4-slowlog-secret"
 _TOKEN_VALUE = "stage4-token-value"
 _URL = f"redis://default:{_PASSWORD}@cache.internal:6379/0"
+_EXPECTED_OPERATIONS = {
+    "info",
+    "slowlog",
+    "acl_log",
+    "config_get",
+    "client_list",
+    "cluster_info",
+    "replication_info",
+    "memory_stats",
+    "sample_keys",
+    "search_indexes",
+    "search_index_info",
+}
 
 
 def _assert_no_sensitive_markers(value: Any) -> None:
@@ -222,20 +235,11 @@ def make_provider(fake_client: FakeRedisClient | None = None) -> RedisCommandToo
 
 def test_create_tool_schemas_exposes_stage4_tools() -> None:
     provider = make_provider()
-    suffixes = {tool.name.rsplit("_", 1)[-1] for tool in provider.create_tool_schemas()}
-    names = {tool.name for tool in provider.create_tool_schemas()}
+    schemas = provider.create_tool_schemas()
+    operations = {provider.resolve_operation(tool.name, {}) for tool in schemas}
 
-    assert any(name.endswith("info") for name in names)
-    assert "slowlog" in suffixes
-    assert any(name.endswith("acl_log") for name in names)
-    assert any(name.endswith("config_get") for name in names)
-    assert any(name.endswith("client_list") for name in names)
-    assert any(name.endswith("cluster_info") for name in names)
-    assert any(name.endswith("replication_info") for name in names)
-    assert any(name.endswith("memory_stats") for name in names)
-    assert any(name.endswith("sample_keys") for name in names)
-    assert any(name.endswith("search_indexes") for name in names)
-    assert any(name.endswith("search_index_info") for name in names)
+    assert len(schemas) == len(_EXPECTED_OPERATIONS)
+    assert operations == _EXPECTED_OPERATIONS
 
 
 @pytest.mark.asyncio
@@ -318,6 +322,28 @@ async def test_memory_stats_marks_unsupported_command() -> None:
     assert result["error_type"] == "unsupported_command"
 
 
+@pytest.mark.asyncio
+async def test_optional_cluster_and_search_commands_return_error_envelopes() -> None:
+    class UnsupportedFeatureClient(FakeRedisClient):
+        async def cluster(self, subcommand: str) -> Any:
+            raise RuntimeError("This instance has cluster support disabled")
+
+        async def execute_command(self, command: str, *args: Any) -> Any:
+            raise RuntimeError(f"unknown command {command!r}")
+
+    provider = make_provider(UnsupportedFeatureClient())
+
+    results = [
+        await provider.cluster_info(),
+        await provider.search_indexes(),
+        await provider.search_index_info("idx:missing"),
+    ]
+
+    assert all(result["status"] == "error" for result in results)
+    assert all("error" in result for result in results)
+    _assert_no_sensitive_markers(results)
+
+
 def test_get_client_uses_real_url_but_logs_only_masked_url(monkeypatch, caplog) -> None:
     fake_client = FakeRedisClient()
     seen: dict[str, Any] = {}
@@ -331,6 +357,7 @@ def test_get_client_uses_real_url_but_logs_only_masked_url(monkeypatch, caplog) 
     caplog.set_level(logging.INFO)
     provider = RedisCommandToolProvider(redis_instance=make_instance())
 
+    assert provider._client is None
     assert provider.get_client() is fake_client
     assert seen == {"url": _URL, "decode_responses": True}
     _assert_no_sensitive_markers(caplog.text)

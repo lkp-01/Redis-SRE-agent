@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 一个 exporter 通过 target 参数依次访问三个测试节点，避免复制三套容器。
+  - job_name: redis
+    metrics_path: /scrape
+    static_configs:
+      - targets: ["redis://redis-sre-primary:6379"]
+        labels:
+          redis_role: primary
+      - targets: ["redis://redis-sre-replica1:6379"]
+        labels:
+          redis_role: replica
+      - targets: ["redis://redis-sre-replica2:6379"]
+        labels:
+          redis_role: replica
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        regex: "redis://([^/]+)"
+        replacement: "$1"
+        target_label: instance
+      - target_label: __address__
+        replacement: redis-sre-exporter:9121

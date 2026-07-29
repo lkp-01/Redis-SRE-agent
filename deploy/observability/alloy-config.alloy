@@ -1,0 +1,57 @@
+// Alloy 通过 Docker API 发现容器，仅保留本项目的三个 Redis 节点。
+discovery.docker "local" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+discovery.relabel "redis" {
+  targets = discovery.docker.local.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "redis-sre-observability"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "redis-(primary|replica1|replica2)"
+    action        = "keep"
+  }
+
+  // 这些稳定标签供后续 Loki 诊断工具筛选实例。
+  rule {
+    replacement  = "redis"
+    target_label = "job"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "instance"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "redis-(.*)"
+    replacement   = "$1"
+    target_label  = "redis_role"
+  }
+}
+
+loki.source.docker "redis" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.redis.output
+  forward_to       = [loki.write.local.receiver]
+  refresh_interval = "5s"
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

@@ -296,77 +296,128 @@ class ToolManager:
     async def _load_mcp_providers(self) -> None:
         """加载当前 turn 独占的只读 MCP provider，失败不阻断内建诊断。"""
 
+        # 1. 从全局配置对象中读取 MCP 服务器列表配置
         mcp_servers = settings.mcp_servers
+        # 如果没有配置任何 MCP 服务器，直接退出当前函数，无事发生
         if not mcp_servers:
             return None
+
+        # 2. 防呆检查：必须保证 ToolManager 已经通过 `async with` 启动，
+        # 因为后续需要用到 `_stack` (异步退出栈) 来自动管理外部进程/连接的生命周期。
         if self._stack is None:
             raise RuntimeError("ToolManager must be entered before loading MCP providers.")
 
+        # 3. 延迟导入所需的配置模型和 Provider 类。
+        # 放在函数内部导入是为了避免在模块刚启动时就产生复杂的循环依赖问题。
         from redis_sre_agent.core.config import MCPServerConfig
         from redis_sre_agent.tools.mcp.provider import MCPToolProvider
 
+        # 4. 获取需要排除的工具分类集合。大模型调用时可能会要求某些类型的工具不加载。
         excluded_capabilities = set(self.exclude_mcp_categories or [])
+
+        # 5. 遍历配置里的每一个 MCP 服务器（server_name 是服务器名，raw_config 是具体配置项）
         for server_name, raw_config in mcp_servers.items():
+            # 给当前 MCP 服务器生成一个“身份证号”，用于防重复加载
             provider_key = f"mcp:{server_name}"
+            # 如果这个身份证号已经在已加载集合里了，说明处理过了，直接跳到下一个
             if provider_key in self._loaded_provider_keys:
                 continue
+
+            # 6. 配置解析与校验
             try:
+                # 如果传入的已经是数据类实例则直接用；否则通过 Pydantic 将其验证并转换为模型对象
                 server_config = (
                     raw_config
                     if isinstance(raw_config, MCPServerConfig)
                     else MCPServerConfig.model_validate(raw_config)
                 )
             except Exception:
+                # 解析失败说明配置写错了，打个警告日志然后跳过，不让整个程序崩溃
                 logger.warning("External MCP provider skipped: mcp_config_invalid")
                 continue
 
+            # 7. 环境连通性检查
+            # 如果配置里指定了启动命令，先去系统环境变量里找找看这个命令存不存在
             if server_config.command and not _command_is_available(server_config.command):
                 logger.warning("External MCP provider skipped: mcp_command_unavailable")
                 continue
+            # 检查启动参数里如果指定了本地脚本路径，那个文件到底在不在硬盘上
             if _missing_local_mcp_arg_path(server_config.args) is not None:
                 logger.warning("External MCP provider skipped: mcp_entrypoint_unavailable")
                 continue
 
+            # 8. 核心加载逻辑
             try:
+                # 实例化这个 MCP 的提供者对象
                 provider = MCPToolProvider(
                     server_name=str(server_name),
                     server_config=server_config,
-                    redis_instance=None,
+                    redis_instance=None,  # MCP 工具属于外部集成，一般不默认绑定特定的 Redis 实例
                 )
+                # 将实例化的 provider 扔进异步退出栈里托管，并启动它。
+                # 这样 ToolManager 销毁时，这个 MCP 服务器进程也会被干净地杀掉。
                 provider = await self._stack.enter_async_context(provider)
+
+                # 让 provider 把自己能提供的所有小工具都掏出来
                 discovered_tools = provider.tools()
+
+                # 9. 筛选工具
+                # 从掏出来的工具里只挑出符合要求的：
+                # 条件 A：必须是 READ（只读）类型，防止外部未授权工具乱改系统状态。
+                # 条件 B：该工具的能力分类不在我们的排除名单上。
                 candidates = [
                     tool
                     for tool in discovered_tools
                     if tool.metadata.action_kind is ToolActionKind.READ
-                    and tool.metadata.capability not in excluded_capabilities
+                       and tool.metadata.capability not in excluded_capabilities
                 ]
 
+                # 10. 冲突检测
+                # 提取出所有候选工具的名字
                 candidate_names = [tool.metadata.name for tool in candidates]
+                # 检查 1：有没有工具的名字是空字符串？
                 has_invalid_name = any(not name for name in candidate_names)
+                # 检查 2：当前这批工具里，有没有出现重名的现象？
                 has_batch_conflict = len(candidate_names) != len(set(candidate_names))
+                # 检查 3：当前这批工具的名字，跟以前已经注册在案的其他工具重名了吗？
                 has_existing_conflict = any(
                     name in self._routing_table or name in self._tool_by_name
                     for name in candidate_names
                 )
+
+                # 如果名字有任何问题，直接把这个 MCP 提供的所有工具都毙掉（跳过），确保系统稳定
                 if has_invalid_name or has_batch_conflict or has_existing_conflict:
                     logger.warning("External MCP provider skipped: mcp_name_conflict")
                     continue
 
+                # 11. 依赖反转注入
+                # 尝试把大管家（当前 ToolManager 实例）反向挂载给 provider，以便它有需要时调用。
+                # 套在 try 里面是因为如果 provider 不支持这个属性设置，失败了也无所谓。
                 try:
                     setattr(provider, "_manager", self)
                 except Exception:
                     pass
+
+                # 12. 正式注册上户口
                 for tool in candidates:
                     name = tool.metadata.name
+                    # 登记路由：大模型叫这个名字时，去哪个 provider 找它
                     self._routing_table[name] = provider
+                    # 加入大名单：大模型获取“可用工具列表”时会读这个 list
                     self._tools.append(tool)
+                    # 建立快速索引：根据名字一秒查到工具对象本体
                     self._tool_by_name[name] = tool
+
+                # 把这个提供者正式加进大管家的提供者列表里
                 self._providers.append(provider)
+                # 给它的身份证打上“已加载”的勾，防止下次重复处理
                 self._loaded_provider_keys.add(provider_key)
+
             except Exception:
+                # 捕获上述加载、启动或注册过程中抛出的任何疑难杂症异常
                 logger.warning("External MCP provider skipped: mcp_provider_unavailable")
                 continue
+
         return None
 
     async def _load_support_package_provider(self) -> None:

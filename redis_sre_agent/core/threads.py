@@ -178,38 +178,65 @@ class ThreadManager:
             return False
 
     async def update_thread_context(
-        self,
-        thread_id: str,
-        context_updates: Dict[str, Any],
-        merge: bool = True,
+            self,
+            thread_id: str,
+            context_updates: Dict[str, Any],
+            merge: bool = True,
     ) -> bool:
         try:
+            # 1. 获取异步 Redis 客户端实例
             client = await self._get_client()
+
+            # 2. 根据 thread_id 生成该会话在 Redis 中对应的所有 Key（包括 metadata, context, messages 等的键名）
             keys = self._get_thread_keys(thread_id)
+
+            # 3. 检查 Redis 中是否存在该 Thread 的元数据 Key。如果不存在，说明该 thread_id 无效或已过期，直接返回 False
             if not await client.exists(keys["metadata"]):
                 return False
+
+            # 4. 初始化一个字典，用于存放最终需要写入 Redis Hash 的键值对（Redis Hash 的 field 和 value 都必须是字符串）
             context_to_save: Dict[str, str] = {}
+
+            # 5. 如果 merge 为 True（默认值），执行“合并/追加”逻辑
             if merge:
+                # 从 Redis Hash 中取出该 Thread 当前已有的所有上下文数据
                 existing = await client.hgetall(keys["context"])
+
+                # 将原有数据解码为字符串，并预先放入待保存的字典中，确保老数据不丢失
                 context_to_save.update(
                     {
                         str(_decode(key)): str(_decode(value))
                         for key, value in existing.items()
                     }
                 )
+            # 6. 如果 merge 为 False，执行“完全覆盖”逻辑
             else:
+                # 直接从 Redis 中删除该 Thread 原有的整个 context Hash 键，清空老数据
                 await client.delete(keys["context"])
+
+            # 7. 将用户传入的、需要更新的 context_updates 字典进行序列化，并合并/覆盖到待保存的字典中
             context_to_save.update(
                 {
+                    # 确保 Key 是字符串，Value 通过 _serialize_context_value 转换（如果是 dict/list 会转为 JSON 字符串）
                     str(key): _serialize_context_value(value)
                     for key, value in (context_updates or {}).items()
                 }
             )
+
+            # 8. 如果最终有需要保存的数据，则调用 Redis 的 hset 命令将最新的映射关系一次性写入 Hash 中
             if context_to_save:
                 await client.hset(keys["context"], mapping=context_to_save)
+
+            # 9. 更新该 Thread 元数据中的“最后更新时间（updated_at）”为当前最新的 UTC 时间
             await client.hset(keys["metadata"], "updated_at", _now_iso())
+
+            # 10. 重新为该 Thread 相关的所有 Redis Key 刷新过期时间（TTL），防止会话因为长期不活跃而被 Redis 自动删除
             await self._refresh_thread_ttl(thread_id)
+
+            # 11. 整个更新流程成功完成，返回 True
             return True
+
+        # 12. 捕获期间发生的所有异常（如 Redis 连接断开、序列化失败等），防止程序崩溃，并返回 False 告知调用方更新失败
         except Exception:
             return False
 
@@ -275,13 +302,20 @@ class ThreadManager:
             return False
 
     async def set_message_trace(
-        self,
-        message_id: str,
-        tool_envelopes: List[Dict[str, Any]],
-        otel_trace_id: Optional[str] = None,
+            self,
+            message_id: str,
+            tool_envelopes: List[Dict[str, Any]],
+            otel_trace_id: Optional[str] = None,
     ) -> bool:
+        # 从 redis_sre_agent.agent.models 模块中延迟导入 DecisionTrace 追踪模型
+        # 延迟导入通常是为了避免循环依赖（Circular Import）
         from redis_sre_agent.agent.models import DecisionTrace
 
+        # 实例化一个决策追踪对象（DecisionTrace）
+        # 1. message_id: 绑定当前追踪记录属于哪一条消息
+        # 2. tool_envelopes: 记录当前轮次中 Agent 调用工具的详细信封/数据包列表
+        # 3. otel_trace_id: OpenTelemetry 的分布式链路追踪 ID（若有），用于和外部微服务链路串联
+        # 4. created_at: 生成当前 UTC 时间的 ISO 字符串，记录追踪创建时间
         trace = DecisionTrace(
             message_id=message_id,
             tool_envelopes=list(tool_envelopes or []),
@@ -289,14 +323,22 @@ class ThreadManager:
             created_at=_now_iso(),
         )
         try:
+            # 获取异步 Redis 客户端实例
             client = await self._get_client()
+
+            # 将 trace 对象序列化为 JSON 字符串，并通过 setex 命令写入 Redis
+            # 1. RedisKeys.message_decision_trace(message_id): 生成该消息追踪专属的 Redis Key
+            # 2. MESSAGE_TRACE_TTL_SECONDS: 过期时间（代码上方定义为 7 天），过期后 Redis 自动清理
+            # 3. trace.model_dump_json(): 将 Pydantic 模型转换为 JSON 文本进行持久化
             await client.setex(
                 RedisKeys.message_decision_trace(message_id),
                 MESSAGE_TRACE_TTL_SECONDS,
                 trace.model_dump_json(),
             )
+            # 写入成功，返回 True
             return True
         except Exception:
+            # 捕获期间发生的所有异常（如网络抖动、Redis 宕机等），防止阻塞主业务流程，并返回 False
             return False
 
     async def get_message_trace(self, message_id: str) -> Optional[Dict[str, Any]]:

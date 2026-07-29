@@ -817,6 +817,7 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
             self.app = app
 
             # 触发图谱异步执行 (ainvoke)，大模型会在这里开始循环推理和调用工具
+            # AgentState只是一次图内部运行的全局状态，所以必须找个能接收到它的
             final_state = await app.ainvoke(
                 initial_state,
                 config=build_graph_config(  # 传递图谱运行配置

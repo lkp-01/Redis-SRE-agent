@@ -19,6 +19,21 @@ from redis_sre_agent.tools.models import (
 )
 
 
+_EXPECTED_REDIS_OPERATIONS = {
+    "info",
+    "slowlog",
+    "acl_log",
+    "config_get",
+    "client_list",
+    "cluster_info",
+    "replication_info",
+    "memory_stats",
+    "sample_keys",
+    "search_indexes",
+    "search_index_info",
+}
+
+
 class FakeInfoClient:
     """只覆盖 INFO 的 fake client，避免链路测试访问真实 Redis。"""
 
@@ -63,6 +78,18 @@ async def test_tool_manager_loads_target_discovery_and_redis_info_tool(monkeypat
     assert result["status"] == "success"
     assert result["section"] == "all"
     assert result["data"]["redis_version"] == "stage4-fake"
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_registers_exact_redis_diagnostic_contract() -> None:
+    async with ToolManager(redis_instance=make_instance()) as manager:
+        providers = manager.get_providers_for_capability(ToolCapability.DIAGNOSTICS)
+        provider = next(item for item in providers if item.provider_name == "redis_command")
+        definitions = manager.get_tools_by_provider_names(["redis_command"])
+        operations = {provider.resolve_operation(tool.name, {}) for tool in definitions}
+
+    assert len(definitions) == len(_EXPECTED_REDIS_OPERATIONS)
+    assert operations == _EXPECTED_REDIS_OPERATIONS
 
 
 @pytest.mark.asyncio
