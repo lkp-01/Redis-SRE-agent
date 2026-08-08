@@ -206,7 +206,7 @@ def test_chat_prompt_preserves_original_target_discovery_rules() -> None:
 
     assert "list_known_redis_targets" in prompt
     assert "resolve_redis_targets" in prompt
-    assert "exact match" in prompt
+    assert "exact live match" in prompt
     assert "ambiguous" in prompt
 
 

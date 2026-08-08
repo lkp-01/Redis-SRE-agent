@@ -36,6 +36,7 @@ from .helpers import (
     resolve_graph_thread_id,
 )
 from .models import AgentResponse, TopicsList
+from .prompts import SRE_SYSTEM_PROMPT
 from .terminal_synthesis import (
     TerminalSynthesisConfig,
     build_deterministic_diagnostic_response,
@@ -44,14 +45,6 @@ from .terminal_synthesis import (
 from .tool_execution import execute_tool_calls_with_gate
 
 logger = logging.getLogger(__name__)
-
-
-SRE_SYSTEM_PROMPT = """You are a Redis SRE deep triage agent.
-
-Use the available Redis tools to gather live diagnostic evidence before drawing
-conclusions. Prefer read-only diagnostics, keep tool calls iterative, and make
-the final answer evidence-backed.
-"""
 
 
 class AgentState(TypedDict):
@@ -186,30 +179,66 @@ class SRELangGraphAgent:
         initial_assessment_lines: List[str],
         per_topic_recommendations: List[Dict[str, Any]],
         instance_ctx: Optional[Dict[str, Any]],
+        safety_and_fact_check_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """按 original 固定章节让 LLM 统一编辑最终 Markdown。"""
+        """按 original 的严格模板，把已有分析材料整理成最终 Markdown。"""
 
         payload = {
             "initial_assessment_lines": initial_assessment_lines or [],
             "per_topic_recommendations": per_topic_recommendations or [],
             "instance": instance_ctx or {},
         }
+        if safety_and_fact_check_notes:
+            payload["safety_and_fact_check_notes"] = safety_and_fact_check_notes
+
         messages: List[BaseMessage] = [
             SystemMessage(
-                content=(
-                    "You are a careful technical editor. Compose a final operator-facing report "
-                    "in Markdown. Use only the supplied JSON. Do not invent facts, commands, "
-                    "endpoints, sources, or metrics."
-                )
+                content="""
+You are a careful technical editor. Compose a final operator-facing report in Markdown.
+CRITICAL RULES:
+- Do NOT invent facts, commands, endpoints, or metrics.
+- Use ONLY information present in the provided JSON payload.
+- You MAY remove duplicates and merge overlapping content; you MUST NOT add anything new.
+- Prefer short, direct sentences. Bold only the most important metrics.
+- Code blocks only for commands/API examples that appear in the payload.
+- If something is missing, omit it—do not guess.
+"""
             ),
             HumanMessage(
                 content=(
-                    "Produce one Markdown document with these headings exactly once and in order:\n"
-                    "## Initial Assessment\n## What I'm Seeing\n## My Recommendation\n"
-                    "## Supporting Info\n"
-                    "Deduplicate overlapping material. If a section is empty, write a short neutral "
-                    "sentence. Return Markdown only.\n\nJSON payload:\n"
-                    + json.dumps(payload, ensure_ascii=False, default=str)
+                    f"""
+You will receive a JSON payload with analysis artifacts. It may contain multiple reports or fragments that each follow the same outline.
+Produce a SINGLE consolidated Markdown document with ONE set of top-level headings in this exact order (include each heading once):
+
+## Initial Assessment
+
+## What I'm Seeing
+
+## My Recommendation
+
+## Supporting Info
+
+## Safety and Fact Checking (include ONLY if 'safety_and_fact_check_notes' is non-empty)
+
+Consolidation rules (no new facts; deduplication is encouraged):
+- Initial Assessment: Synthesize a single brief summary from all
+'initial_assessment_lines'. Combine overlapping lines and remove duplicates.
+- What I'm Seeing: Aggregate key findings across inputs. Group related items and remove repeated statements/metrics.
+- My Recommendation: Use '### <topic or plan title>' sub-headings for each distinct recommendation area across inputs.
+  - Merge areas with identical or near-duplicate titles (case/punctuation-insensitive) into one sub-heading.
+  - Within each sub-heading, preserve the original step order, remove duplicate
+    steps, and collapse identical commands/API examples. Do not invent new steps.
+- Supporting Info: Combine and de-duplicate citations/sources.
+- Safety and Fact Checking: If provided, summarize 'safety_and_fact_check_notes' as bullet points. Keep it concise and do NOT alter previous sections.
+- If a section would be empty, include the heading with a short, neutral sentence — EXCEPT omit the 'Safety and Fact Checking' section entirely when 'safety_and_fact_check_notes' is empty.
+
+Return Markdown only.
+
+JSON payload of analyses artifacts:
+```
+{json.dumps(payload, default=str)}
+```
+"""
                 )
             ),
         ]
@@ -218,7 +247,80 @@ class SRELangGraphAgent:
             messages,
             request_kind="langgraph_agent.composer",
         )
-        return coerce_response_text(getattr(response, "content", ""))
+        content = getattr(response, "content", "") or ""
+        if isinstance(content, list):
+            try:
+                parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content") or ""
+                        if isinstance(text, str) and text:
+                            parts.append(text)
+                    elif isinstance(part, str):
+                        parts.append(part)
+                content = "\n".join(parts).strip()
+            except Exception:
+                content = str(content)
+        elif not isinstance(content, str):
+            content = str(content)
+
+        if not content:
+            logger.warning("Final markdown composer returned no content")
+            return ""
+
+        # 当前切片尚未恢复 safety corrector；没有事实核查材料时移除模型误加的章节。
+        if not safety_and_fact_check_notes:
+            try:
+                import re as _re
+
+                content = _re.sub(
+                    r"\n##\s*Safety and Fact Checking[\s\S]*$",
+                    "",
+                    content,
+                    flags=_re.IGNORECASE,
+                )
+            except Exception:
+                pass
+
+        return content
+
+    @staticmethod
+    def _build_final_markdown_fallback(
+        *,
+        initial_writeup: str,
+        recommendations: List[Dict[str, Any]],
+        topics: List[Dict[str, Any]],
+    ) -> str:
+        """composer 失败时仍按 original 的固定章节返回可读报告。"""
+
+        assessment = initial_writeup or "没有生成额外的初步判断。"
+        blocks = [f"## Initial Assessment\nRedis 深度诊断报告\n\n{assessment}"]
+        blocks.append("## What I'm Seeing\n请结合已收集的工具 evidence 阅读以下建议。")
+
+        recommendation_lines = ["## My Recommendation"]
+        for recommendation in recommendations or []:
+            title = recommendation.get("title") or next(
+                (
+                    topic.get("title")
+                    for topic in topics
+                    if topic.get("id") == recommendation.get("topic_id")
+                ),
+                "Recommendation",
+            )
+            recommendation_lines.append(f"### {title}")
+            for step in recommendation.get("steps") or []:
+                description = step.get("description") or ""
+                if description:
+                    recommendation_lines.append(f"- {description}")
+                for command in step.get("commands") or []:
+                    recommendation_lines.append(f"```bash\n{command}\n```")
+                for api_example in step.get("api_examples") or []:
+                    recommendation_lines.append(f"```bash\n{api_example}\n```")
+        if len(recommendation_lines) == 1:
+            recommendation_lines.append("当前 evidence 不足以生成具体建议。")
+        blocks.append("\n".join(recommendation_lines))
+        blocks.append("## Supporting Info\n- Plans derived from tool results.")
+        return "\n\n".join(blocks)
 
     async def _synthesize_reasoning_fallback(
         self,
@@ -284,6 +386,8 @@ class SRELangGraphAgent:
                 generation = current_generation
 
             # 兼容性处理：尝试调用不同版本的 API 获取格式化好的 LLM 工具定义，并限制单次最多加载 64 个工具
+            recommendations: List[Dict[str, Any]] = []
+            initial_writeup = ""
             try:
                 tooldefs = tool_mgr.get_tools_for_llm(max_tools=64)
             except TypeError:
@@ -605,10 +709,10 @@ class SRELangGraphAgent:
                     raise ValueError("Final markdown composer returned empty text")
             except Exception as exc:
                 logger.warning("Triage recommendation/composer failed: %s", exc, exc_info=True)
-                response_text = build_deterministic_diagnostic_response(
-                    query,
-                    envelopes,
-                    agent_kind="triage",
+                response_text = self._build_final_markdown_fallback(
+                    initial_writeup=initial_writeup,
+                    recommendations=recommendations,
+                    topics=topics,
                 )
 
             return {
