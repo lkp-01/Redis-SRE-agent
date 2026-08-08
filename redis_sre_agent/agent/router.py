@@ -197,13 +197,28 @@ async def query_needs_live_redis_scope(
     query: str,
     conversation_history: Optional[List[BaseMessage]] = None,
 ) -> bool:
-    """判断零 scope 查询是否需要 Redis live 工具。"""
+    """判断零 scope 查询是实时排查，还是只需要知识说明。"""
 
     normalized_query = str(query or "").lower()
-    diagnostic_markers = (
+    operational_markers = (
         "check",
         "diagnose",
         "triage",
+        "show slowlog",
+        "排查",
+        "诊断",
+        "检查",
+        "故障",
+        "异常",
+        "报错",
+        "超时",
+        "卡顿",
+        "有点慢",
+        "很慢",
+        "延迟很高",
+        "阻塞",
+    )
+    diagnostic_markers = (
         "slowlog",
         "memory",
         "client",
@@ -216,6 +231,11 @@ async def query_needs_live_redis_scope(
         "health",
         "issue",
         "problem",
+        "慢查询",
+        "延迟",
+        "内存",
+        "客户端",
+        "连接",
     )
     knowledge_markers = (
         "what is",
@@ -224,9 +244,21 @@ async def query_needs_live_redis_scope(
         "explain",
         "documentation",
         "general",
+        "guidance",
+        "guide",
+        "什么是",
+        "怎么工作",
+        "原理",
+        "最佳实践",
+        "解释",
+        "文档",
+        "指南",
+        "指引",
     )
+    if any(marker in normalized_query for marker in operational_markers):
+        return True
+    if any(marker in normalized_query for marker in knowledge_markers):
+        return False
     if any(marker in normalized_query for marker in diagnostic_markers):
         return True
-    if "redis" in normalized_query and any(marker in normalized_query for marker in knowledge_markers):
-        return False
     return "redis" in normalized_query

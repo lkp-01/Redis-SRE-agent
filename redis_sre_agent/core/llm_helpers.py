@@ -50,6 +50,14 @@ class FailoverChatModel:
             fallback=self.fallback.bind_tools(tools, **kwargs),
         )
 
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> "FailoverChatModel":
+        """让主、副模型使用相同的结构化输出 schema。"""
+
+        return FailoverChatModel(
+            primary=self.primary.with_structured_output(schema, **kwargs),
+            fallback=self.fallback.with_structured_output(schema, **kwargs),
+        )
+
     async def ainvoke(self, input: Any, **kwargs: Any) -> Any:
         try:
             return await self.primary.ainvoke(input, **kwargs)

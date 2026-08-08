@@ -76,6 +76,21 @@ class CorrectionResult(BaseModel):
     edited_response: str = Field(..., description="修正后的回答文本。")
     edits_applied: List[str] = Field(default_factory=list)
 
+
+class TargetSelectionDecision(BaseModel):
+    """DeepSeek 对是否实时诊断以及诊断目标作出的结构化决定。"""
+
+    requires_live_diagnostics: bool = Field(
+        ..., description="当前请求是否必须读取实时 Redis 状态才能回答。"
+    )
+    selected_target: Optional[str] = Field(
+        None, description="从安全目标目录中选择的完整 display_name。"
+    )
+    reason_code: str = Field(
+        default="", description="简短决策标签，不包含思维过程。"
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
 # AI思考完最终打包出来的东西，包括回复、缩到的结果、工具调用的证据
 class AgentResponse(BaseModel):
     """Agent 返回值，沿用原项目响应形状。"""

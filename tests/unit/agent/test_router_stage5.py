@@ -56,6 +56,14 @@ async def test_query_needs_live_redis_scope_is_deterministic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_needs_live_redis_scope_understands_chinese_intent() -> None:
+    assert await query_needs_live_redis_scope("Redis 有点慢，帮我看看咋回事") is True
+    assert await query_needs_live_redis_scope("排查一下 Redis 延迟") is True
+    assert await query_needs_live_redis_scope("解释一下 Redis 主从复制原理") is False
+    assert await query_needs_live_redis_scope("Redis 最佳实践有哪些") is False
+
+
+@pytest.mark.asyncio
 async def test_router_uses_nano_factory_when_key_is_configured(monkeypatch) -> None:
     llm = RouterLLM(content="DEEP_TRIAGE")
     monkeypatch.setattr(router_module.settings, "openai_api_key", SecretStr("configured"))

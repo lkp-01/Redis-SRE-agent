@@ -42,8 +42,10 @@ class TargetDiscoveryToolProvider(ToolProvider):
                 name=self._make_tool_name("list_known_redis_targets"),
                 # 描述工具的用途，大模型会根据这段文字来判断什么时候调用该工具
                 description=(
-                    "List safe Redis targets currently known in the target catalog. "
-                    "This returns public metadata only and does not attach live tools."
+                    "List the safe Redis targets currently known in your target catalog. "
+                    "Use this when the user asks what Redis targets, instances, databases, "
+                    "or clusters you know about without naming a specific one yet. "
+                    "This does not attach live tools."
                 ),
                 # 标记工具能力类型为通用工具/实用工具
                 capability=ToolCapability.UTILITIES,
@@ -71,8 +73,11 @@ class TargetDiscoveryToolProvider(ToolProvider):
                 name=self._make_tool_name("resolve_redis_targets"),
                 # 描述：将人类的自然语言描述（如“帮我查一下大仓的Redis”）解析为安全的匹配项和不透明的目标句柄
                 description=(
-                    "Resolve natural-language Redis target descriptions into secret-safe matches "
-                    "and opaque target handles."
+                    "Resolve natural-language target descriptions like 'prod checkout cache' "
+                    "or 'the us-east enterprise cluster' into safe Redis target matches. "
+                    "This tool only returns secret-safe metadata and opaque target handles. "
+                    "Use it before live diagnostics when the user has not provided an "
+                    "explicit instance_id or cluster_id."
                 ),
                 capability=ToolCapability.UTILITIES,
                 parameters={

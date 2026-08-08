@@ -8,6 +8,7 @@ LangGraph/LangChain message runtime；没有外部 LLM 时仅用 fake LLM 作为
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
@@ -30,7 +31,8 @@ from .helpers import (
     guarded_ainvoke,
     resolve_graph_thread_id,
 )
-from .models import AgentResponse
+from .models import AgentResponse, TargetSelectionDecision
+from .router import format_conversation_context, query_needs_live_redis_scope
 from .terminal_synthesis import (
     TerminalSynthesisConfig,
     build_deterministic_diagnostic_response,
@@ -48,6 +50,14 @@ Work iteratively:
 2. Call a small number of tools.
 3. Read the returned evidence before deciding whether to call more tools.
 4. Answer only from collected evidence and clearly say when evidence is missing.
+
+For target discovery:
+- If the user asks what Redis targets you know about, call `list_known_redis_targets`.
+- If the user describes a target but has not given `instance_id` or `cluster_id`, call `resolve_redis_targets` before making live-state claims.
+- Only treat target discovery as confirmed when it returns an exact match. If the match is fuzzy, partial, or ambiguous, ask the user to confirm the target before attaching tools or describing live state.
+- If the user asks to compare multiple targets, call `resolve_redis_targets` with `allow_multiple=true` and gather evidence for each attached target.
+- If discovery returns `status="too_many_matches"`, ask the user to narrow the request to the reported `max_selectable` count; do not inspect a partial set.
+- A hostname or hostname fragment is not enough to assume a target. Without an exact match, do not attach or describe a different Redis deployment.
 """
 
 
@@ -163,6 +173,8 @@ class ChatAgent:
         self,
         tool_mgr: ToolManager,
         emitter: Optional[Any] = None,
+        *,
+        target_selection_complete: bool = False,
     ) -> StateGraph:
         """构建 ChatAgent 的 LangGraph 风格 workflow。"""
 
@@ -181,6 +193,14 @@ class ChatAgent:
                 tooldefs = tool_mgr.get_tools_for_llm()
             except AttributeError:
                 tooldefs = tool_mgr.get_tools()
+            if target_selection_complete:
+                tooldefs = [
+                    tool
+                    for tool in tooldefs
+                    if not tool.name.endswith(
+                        ("list_known_redis_targets", "resolve_redis_targets")
+                    )
+                ]
             cache_key = (generation, len(tooldefs))
             cached = runtime_tools_by_generation.get(cache_key)
             if cached is not None:
@@ -339,6 +359,220 @@ class ChatAgent:
         if bindings:
             await tool_mgr.attach_bound_targets(bindings, generation=generation)
 
+    @staticmethod
+    def _target_discovery_tools(tool_mgr: ToolManager) -> Dict[str, Any]:
+        """按操作名索引常驻的目标发现工具。"""
+
+        tools = tool_mgr.get_tools_by_provider_names(["target_discovery"])
+        indexed: Dict[str, Any] = {}
+        for tool in tools:
+            for operation in ("list_known_redis_targets", "resolve_redis_targets"):
+                if tool.name.endswith(operation):
+                    indexed[operation] = tool
+        return indexed
+
+    @staticmethod
+    def _format_target_choices(targets: List[Dict[str, Any]], total: int) -> str:
+        """只用公开字段生成候选目标提示，避免泄露内部连接信息。"""
+
+        lines = [
+            f"这个请求需要访问实时 Redis，但当前没有绑定目标；目录中有 {total} 个可诊断目标："
+        ]
+        for target in targets[:5]:
+            name = str(target.get("display_name") or "未命名目标")
+            environment = str(target.get("environment") or "未标注环境")
+            target_type = str(target.get("target_type") or target.get("target_kind") or "Redis")
+            usage = str((target.get("public_metadata") or {}).get("usage") or "").strip()
+            suffix = f"，用途：{usage}" if usage else ""
+            lines.append(f"- {name}（{environment}，{target_type}{suffix}）")
+        if total > 5:
+            lines.append(f"- 另有 {total - 5} 个目标未展开")
+        lines.append("请告诉我要排查的实例名或环境；确认后我会继续诊断。")
+        return "\n".join(lines)
+
+    async def _select_unscoped_target(
+        self,
+        *,
+        query: str,
+        targets: List[Dict[str, Any]],
+        conversation_history: Optional[List[Any]],
+    ) -> Optional[TargetSelectionDecision]:
+        """让 DeepSeek 判断是否需要实时诊断，并从安全目录中选择一个目标。"""
+
+        if not hasattr(self.llm, "with_structured_output"):
+            return None
+
+        safe_targets = []
+        for target in targets:
+            safe_targets.append(
+                {
+                    "display_name": str(target.get("display_name") or ""),
+                    "environment": target.get("environment"),
+                    "target_kind": target.get("target_kind"),
+                    "target_type": target.get("target_type"),
+                    "capabilities": list(target.get("capabilities") or []),
+                    "public_metadata": dict(target.get("public_metadata") or {}),
+                }
+            )
+
+        prompt = """You are the target-selection stage of a Redis SRE agent.
+
+Return only one valid JSON object with these fields:
+- `requires_live_diagnostics`: boolean (required).
+- `selected_target`: a candidate's full `display_name`, or null.
+- `reason_code`: a short string label.
+- `confidence`: a number from 0.0 to 1.0.
+
+- Decide whether answering the user's request requires current, live Redis evidence.
+- If live diagnostics are required and candidates exist, select exactly one candidate.
+- `selected_target` must exactly equal one candidate's full `display_name`.
+- Make the semantic choice yourself from the query, recent conversation, environment,
+  usage, role, and other public metadata. Do not ask the user to choose.
+- Never invent a target and never return an internal ID, address, credential, or handle.
+- If live diagnostics are not required, set `selected_target` to null.
+- `reason_code` must be a short decision label, not hidden reasoning.
+"""
+        payload = {
+            "query": query,
+            "recent_conversation": format_conversation_context(conversation_history),
+            "targets": safe_targets,
+        }
+        try:
+            structured_llm = self.llm.with_structured_output(
+                TargetSelectionDecision,
+                method="json_mode",
+            )
+            raw_decision = await guarded_ainvoke(
+                structured_llm,
+                [
+                    SystemMessage(content=prompt),
+                    HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+                ],
+                request_kind="chat_agent.target_selection",
+            )
+            if isinstance(raw_decision, TargetSelectionDecision):
+                return raw_decision
+            return TargetSelectionDecision.model_validate(raw_decision)
+        except Exception as exc:
+            logger.warning(
+                "Structured target selection failed (error=%s).",
+                type(exc).__name__,
+            )
+            return None
+
+    async def _prepare_unscoped_live_diagnostics(
+        self,
+        *,
+        tool_mgr: ToolManager,
+        query: str,
+        context: Dict[str, Any],
+        conversation_history: Optional[List[Any]],
+    ) -> tuple[List[Dict[str, Any]], Optional[AgentResponse], Optional[str]]:
+        """零 scope 请求先由 DeepSeek 决定是否诊断以及要绑定的一个目标。"""
+
+        has_explicit_scope = bool(
+            self.redis_instance
+            or self.redis_cluster
+            or tool_mgr.get_attached_target_bindings()
+            or tool_mgr.get_tools_by_provider_names(["redis_command"])
+        )
+        if has_explicit_scope:
+            return [], None, None
+
+        # `--target` 已经提供了明确提示，继续沿用 original 的 LLM resolve 链路。
+        target_hint = str(context.get("target_query") or context.get("target") or "").strip()
+        if target_hint:
+            return [], None, None
+
+        discovery_tools = self._target_discovery_tools(tool_mgr)
+        resolve_tool = discovery_tools.get("resolve_redis_targets")
+        list_tool = discovery_tools.get("list_known_redis_targets")
+        if resolve_tool is None or list_tool is None:
+            return [], AgentResponse(
+                response="这个请求需要访问实时 Redis，但当前无法使用目标发现工具。"
+            ), None
+
+        tooldefs_by_name = {tool.name: tool for tool in discovery_tools.values()}
+        envelopes: List[Dict[str, Any]] = []
+
+        async def call_discovery(tool: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+            result = await tool_mgr.resolve_tool_call(tool.name, args)
+            envelope = build_result_envelope(tool.name, args, result, tooldefs_by_name)
+            envelopes.append(envelope)
+            data = envelope.get("data")
+            return data if isinstance(data, dict) else {}
+
+        inventory_args = {
+            "capability": "diagnostics",
+            "limit": 20,
+            "offset": 0,
+            "include_aliases": False,
+        }
+        inventory = await call_discovery(list_tool, inventory_args)
+        targets = [item for item in inventory.get("targets") or [] if isinstance(item, dict)]
+        total = int(inventory.get("total_known_targets") or len(targets))
+
+        decision = await self._select_unscoped_target(
+            query=query,
+            targets=targets,
+            conversation_history=conversation_history,
+        )
+        if decision is None:
+            if not await query_needs_live_redis_scope(query, conversation_history):
+                return [], None, None
+            return envelopes, AgentResponse(
+                response="目标选择模型未能完成结构化决策，因此没有执行实时 Redis 诊断。",
+                tool_envelopes=envelopes,
+            ), None
+        if not decision.requires_live_diagnostics:
+            return [], None, None
+        if total == 0 or not targets:
+            return envelopes, AgentResponse(
+                response="这个请求需要访问实时 Redis，但目标目录中还没有可诊断的 Redis 目标。",
+                tool_envelopes=envelopes,
+            ), None
+
+        selected_name = str(decision.selected_target or "").strip()
+        selected_matches = [
+            target
+            for target in targets
+            if str(target.get("display_name") or "").strip().casefold()
+            == selected_name.casefold()
+        ]
+        if len(selected_matches) != 1:
+            return envelopes, AgentResponse(
+                response=(
+                    "DeepSeek 没有从安全目标目录中返回唯一且有效的实例名，"
+                    "因此没有绑定其他目标，也没有执行实时诊断。"
+                ),
+                tool_envelopes=envelopes,
+            ), None
+
+        canonical_name = str(selected_matches[0].get("display_name") or "").strip()
+        resolve_args = {
+            "query": canonical_name,
+            "allow_multiple": False,
+            "max_results": 5,
+            "attach_tools": True,
+            "preferred_capabilities": ["diagnostics"],
+        }
+        resolved = await call_discovery(resolve_tool, resolve_args)
+        await self._attach_target_tools_from_resolution(tool_mgr, envelopes)
+        if not (
+            resolved.get("status") == "resolved"
+            and resolved.get("attached_target_handles")
+            and tool_mgr.get_tools_by_provider_names(["redis_command"])
+        ):
+            return envelopes, AgentResponse(
+                response=(
+                    f"DeepSeek 已选择 Redis 目标“{canonical_name}”，"
+                    "但该目标未能完成精确绑定，因此没有执行实时诊断。"
+                ),
+                tool_envelopes=envelopes,
+            ), None
+
+        return envelopes, None, canonical_name
+
     def _enhance_query(self, query: str, context: Dict[str, Any]) -> str:
         if self.redis_instance is not None:
             return f"""INSTANCE CONTEXT: This query is about Redis instance:
@@ -400,9 +634,44 @@ User Query: {query}"""
             user_id=user_id,
             graph_type="chat",
         ) as tool_mgr:
-            workflow = self._build_workflow(tool_mgr, emitter)
+            try:
+                preflight_envelopes, early_response, selected_target_name = (
+                    await self._prepare_unscoped_live_diagnostics(
+                        tool_mgr=tool_mgr,
+                        query=query,
+                        context=normalized_context,
+                        conversation_history=conversation_history,
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Chat target preflight failed (error=%s).",
+                    type(exc).__name__,
+                )
+                return AgentResponse(
+                    response="实时诊断所需的 Redis 目标解析失败，请检查目标目录配置后重试。"
+                )
+            if early_response is not None:
+                return early_response
+
+            workflow = self._build_workflow(
+                tool_mgr,
+                emitter,
+                target_selection_complete=bool(selected_target_name),
+            )
             enhanced_query = self._enhance_query(query, normalized_context)
             initial_messages: List[BaseMessage] = [SystemMessage(content=CHAT_SYSTEM_PROMPT)]
+            if selected_target_name:
+                initial_messages.append(
+                    SystemMessage(
+                        content=(
+                            "Target selection is complete. DeepSeek selected and the system "
+                            f"bound the exact target '{selected_target_name}'. Use the available "
+                            "target-scoped diagnostic tools for this request. Do not perform "
+                            "target discovery again in this turn."
+                        )
+                    )
+                )
             if conversation_history:
                 initial_messages.extend(conversation_history)
             initial_messages.append(HumanMessage(content=enhanced_query))
@@ -417,7 +686,7 @@ User Query: {query}"""
                 "startup_system_prompt": CHAT_SYSTEM_PROMPT,
                 "startup_prompt_initialized": True,
                 "toolset_generation": tool_mgr.get_toolset_generation(),
-                "signals_envelopes": [],
+                "signals_envelopes": preflight_envelopes,
             }
             graph_thread_id = resolve_graph_thread_id(session_id, normalized_context)
             try:

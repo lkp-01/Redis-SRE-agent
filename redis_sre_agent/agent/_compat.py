@@ -137,7 +137,38 @@ class _FakeStructuredLLM:
         self.schema = schema
 
     async def ainvoke(self, messages: Sequence[Any]) -> Any:
-        from .models import Recommendation, RecommendationStep, Topic, TopicsList
+        from .models import (
+            Recommendation,
+            RecommendationStep,
+            TargetSelectionDecision,
+            Topic,
+            TopicsList,
+        )
+
+        if self.schema is TargetSelectionDecision:
+            import json
+
+            from .router import query_needs_live_redis_scope
+
+            raw_payload = _message_text(getattr(messages[-1], "content", "")) if messages else ""
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError):
+                payload = {}
+            query = str(payload.get("query") or "")
+            targets = [
+                item for item in payload.get("targets") or [] if isinstance(item, dict)
+            ]
+            requires_live = await query_needs_live_redis_scope(query)
+            selected_target = None
+            if requires_live and targets:
+                selected_target = str(targets[0].get("display_name") or "").strip() or None
+            return TargetSelectionDecision(
+                requires_live_diagnostics=requires_live,
+                selected_target=selected_target,
+                reason_code="local_fake_fallback",
+                confidence=0.5,
+            )
 
         if self.schema is TopicsList:
             payload = "\n".join(_message_text(getattr(message, "content", "")) for message in messages)

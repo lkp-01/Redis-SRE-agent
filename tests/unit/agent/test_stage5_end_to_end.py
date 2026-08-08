@@ -142,6 +142,43 @@ class DynamicMCPThenTargetLLM:
         return AIMessage(content="MCP, target, and Redis evidence collected")
 
 
+class TargetDecisionRunnable:
+    def __init__(self, parent: "StructuredTargetChoosingLLM") -> None:
+        self.parent = parent
+
+    async def ainvoke(self, messages: list[Any]) -> dict[str, Any]:
+        self.parent.decision_calls += 1
+        self.parent.decision_messages = list(messages)
+        return {
+            "requires_live_diagnostics": True,
+            "selected_target": self.parent.selected_target,
+            "reason_code": "fake_semantic_target_choice",
+            "confidence": 0.91,
+        }
+
+
+class StructuredTargetChoosingLLM(FakeToolCallingLLM):
+    def __init__(self, selected_target: str) -> None:
+        super().__init__(agent_kind="chat")
+        self.selected_target = selected_target
+        self.decision_calls = 0
+        self.decision_messages: list[Any] = []
+        self.structured_methods: list[Any] = []
+        self.bound_tool_snapshots: list[list[str]] = []
+
+    def bind_tools(self, tools: list[Any]) -> FakeToolCallingLLM:
+        self.bound_tool_snapshots.append(
+            [str(getattr(tool, "name", "")) for tool in tools]
+        )
+        return super().bind_tools(tools)
+
+    def with_structured_output(self, schema: Any, **_kwargs: Any) -> TargetDecisionRunnable:
+        if getattr(schema, "__name__", "") != "TargetSelectionDecision":
+            return super().with_structured_output(schema, **_kwargs)
+        self.structured_methods.append(_kwargs.get("method"))
+        return TargetDecisionRunnable(self)
+
+
 class FakeE2EMCPSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -166,6 +203,230 @@ def make_instance() -> RedisInstance:
         extension_data={"aliases": ["checkout prod"]},
         status="healthy",
     )
+
+
+def make_second_instance() -> RedisInstance:
+    return RedisInstance(
+        id="inst-stage5-e2e-secondary",
+        name="Lab Search Cache",
+        connection_url=SecretStr(_URL),
+        environment="lab",
+        usage="search-cache",
+        description="Lab fake Redis target",
+        status="healthy",
+    )
+
+
+def make_replication_instances() -> list[RedisInstance]:
+    base = make_instance()
+    return [
+        base.model_copy(
+            update={
+                "id": "redis-test-primary",
+                "name": "redis-sre-primary",
+                "environment": "lab",
+                "usage": "replication-lab",
+            }
+        ),
+        base.model_copy(
+            update={
+                "id": "redis-test-replica1",
+                "name": "redis-sre-replica1",
+                "environment": "lab",
+                "usage": "replication-lab",
+            }
+        ),
+        base.model_copy(
+            update={
+                "id": "redis-test-replica2",
+                "name": "redis-sre-replica2",
+                "environment": "lab",
+                "usage": "replication-lab",
+            }
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unscoped_live_query_uses_structured_ai_choice_for_the_only_target(
+    monkeypatch,
+) -> None:
+    reset_target_integration_registry()
+    instance = make_instance()
+    fake_store = FakeTargetHandleStore()
+
+    async def fake_get_instances():
+        return [instance]
+
+    async def fake_get_clusters():
+        return []
+
+    async def fake_get_instance_by_id(instance_id: str):
+        return instance if instance_id == instance.id else None
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeE2ERedisClient()
+        return self._client
+
+    monkeypatch.setattr(targets_module, "get_instances", fake_get_instances)
+    monkeypatch.setattr(targets_module, "get_clusters", fake_get_clusters)
+    monkeypatch.setattr(target_services, "get_target_handle_store", lambda: fake_store)
+    monkeypatch.setattr(tool_manager_module, "get_target_handle_store", lambda: fake_store)
+    monkeypatch.setattr(redis_binding, "get_instance_by_id", fake_get_instance_by_id)
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        tool_manager_module,
+        "settings",
+        Settings(_env_file=None, rag_enabled=False, mcp_servers={}),
+    )
+
+    llm = StructuredTargetChoosingLLM("Prod Checkout Cache")
+    response = await ChatAgent(llm=llm).process_query(
+        "Redis 有点慢，帮我看看咋回事",
+        session_id="session-unscoped-single",
+        user_id="user-stage5",
+        context={"thread_id": "thread-unscoped-single"},
+    )
+
+    names = [envelope["name"] for envelope in response.tool_envelopes]
+    assert "list_known_redis_targets" in names
+    assert "resolve_redis_targets" in names
+    assert "info" in names
+    assert "slowlog" in names
+    assert "请告诉我" not in response.response
+    assert llm.decision_calls == 1
+    assert llm.structured_methods == ["json_mode"]
+    assert "valid JSON object" in str(llm.decision_messages[0].content)
+    assert {record.public_summary.display_name for record in fake_store.records.values()} == {
+        "Prod Checkout Cache"
+    }
+
+
+@pytest.mark.asyncio
+async def test_unscoped_live_query_binds_the_target_chosen_by_ai_not_primary(
+    monkeypatch,
+) -> None:
+    reset_target_integration_registry()
+    instances = make_replication_instances()
+    instances_by_id = {item.id: item for item in instances}
+    fake_store = FakeTargetHandleStore()
+
+    async def fake_get_instances():
+        return instances
+
+    async def fake_get_clusters():
+        return []
+
+    async def fake_get_instance_by_id(instance_id: str):
+        return instances_by_id.get(instance_id)
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeE2ERedisClient()
+        return self._client
+
+    monkeypatch.setattr(targets_module, "get_instances", fake_get_instances)
+    monkeypatch.setattr(targets_module, "get_clusters", fake_get_clusters)
+    monkeypatch.setattr(target_services, "get_target_handle_store", lambda: fake_store)
+    monkeypatch.setattr(tool_manager_module, "get_target_handle_store", lambda: fake_store)
+    monkeypatch.setattr(redis_binding, "get_instance_by_id", fake_get_instance_by_id)
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        tool_manager_module,
+        "settings",
+        Settings(_env_file=None, rag_enabled=False, mcp_servers={}),
+    )
+
+    llm = StructuredTargetChoosingLLM("redis-sre-replica2")
+    response = await ChatAgent(llm=llm).process_query(
+        "查询有点慢，帮我看看咋回事",
+        session_id="session-unscoped-replication",
+        user_id="user-stage5",
+        context={"thread_id": "thread-unscoped-replication"},
+    )
+
+    names = [envelope["name"] for envelope in response.tool_envelopes]
+    assert "list_known_redis_targets" in names
+    assert "resolve_redis_targets" in names
+    assert "info" in names
+    assert "slowlog" in names
+    assert "请告诉我" not in response.response
+    assert llm.decision_calls == 1
+    assert {record.public_summary.display_name for record in fake_store.records.values()} == {
+        "redis-sre-replica2"
+    }
+    assert llm.bound_tool_snapshots
+    assert all(
+        not any(name.endswith("resolve_redis_targets") for name in snapshot)
+        for snapshot in llm.bound_tool_snapshots
+    )
+
+
+@pytest.mark.asyncio
+async def test_unscoped_live_query_uses_ai_choice_across_unrelated_targets(
+    monkeypatch,
+) -> None:
+    reset_target_integration_registry()
+    instances = [make_instance(), make_second_instance()]
+    instances_by_id = {item.id: item for item in instances}
+    fake_store = FakeTargetHandleStore()
+
+    async def fake_get_instances():
+        return instances
+
+    async def fake_get_clusters():
+        return []
+
+    async def fake_get_instance_by_id(instance_id: str):
+        return instances_by_id.get(instance_id)
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = FakeE2ERedisClient()
+        return self._client
+
+    monkeypatch.setattr(targets_module, "get_instances", fake_get_instances)
+    monkeypatch.setattr(targets_module, "get_clusters", fake_get_clusters)
+    monkeypatch.setattr(target_services, "get_target_handle_store", lambda: fake_store)
+    monkeypatch.setattr(tool_manager_module, "get_target_handle_store", lambda: fake_store)
+    monkeypatch.setattr(redis_binding, "get_instance_by_id", fake_get_instance_by_id)
+    monkeypatch.setattr(RedisCommandToolProvider, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        tool_manager_module,
+        "settings",
+        Settings(_env_file=None, rag_enabled=False, mcp_servers={}),
+    )
+
+    llm = StructuredTargetChoosingLLM("Lab Search Cache")
+    response = await ChatAgent(llm=llm).process_query(
+        "Redis 有点慢，帮我看看咋回事",
+        session_id="session-unscoped-multiple",
+        user_id="user-stage5",
+        context={"thread_id": "thread-unscoped-multiple"},
+    )
+
+    names = [envelope["name"] for envelope in response.tool_envelopes]
+    assert "resolve_redis_targets" in names
+    assert "list_known_redis_targets" in names
+    assert "info" in names
+    assert "slowlog" in names
+    assert "请告诉我" not in response.response
+    assert llm.decision_calls == 1
+    assert {record.public_summary.display_name for record in fake_store.records.values()} == {
+        "Lab Search Cache"
+    }
+    decision_payload = "\n".join(
+        str(getattr(message, "content", "")) for message in llm.decision_messages
+    )
+    assert "Prod Checkout Cache" in decision_payload
+    assert "Lab Search Cache" in decision_payload
+    resolve_envelope = next(
+        envelope
+        for envelope in response.tool_envelopes
+        if envelope["name"] == "resolve_redis_targets"
+    )
+    assert resolve_envelope["args"]["query"] == "Lab Search Cache"
 
 
 @pytest.mark.asyncio

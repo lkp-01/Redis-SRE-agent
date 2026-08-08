@@ -16,6 +16,8 @@ class StubModel:
         self.error = error
         self.calls: list[Any] = []
         self.bound_tools: list[Any] | None = None
+        self.structured_schema: Any = None
+        self.structured_kwargs: dict[str, Any] = {}
 
     async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
         self.calls.append((messages, kwargs))
@@ -33,6 +35,12 @@ class StubModel:
         bound = StubModel(result=self.result, error=self.error)
         bound.bound_tools = list(tools)
         return bound
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> "StubModel":
+        structured = StubModel(result=self.result, error=self.error)
+        structured.structured_schema = schema
+        structured.structured_kwargs = dict(kwargs)
+        return structured
 
 
 def configure_deepseek(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,6 +106,25 @@ async def test_bound_failover_binds_both_models_to_the_same_tools() -> None:
     assert result == "tool-aware response"
     assert bound.primary.bound_tools == ["info"]
     assert bound.fallback.bound_tools == ["info"]
+
+
+@pytest.mark.asyncio
+async def test_structured_failover_applies_the_same_schema_to_both_models() -> None:
+    schema = dict[str, str]
+    primary = StubModel(error=RuntimeError("primary unavailable"))
+    fallback = StubModel(result={"selected_target": "redis-sre-replica2"})
+
+    structured = llm_helpers.FailoverChatModel(
+        primary=primary,
+        fallback=fallback,
+    ).with_structured_output(schema, method="json_mode")
+    result = await structured.ainvoke(["select target"])
+
+    assert result == {"selected_target": "redis-sre-replica2"}
+    assert structured.primary.structured_schema is schema
+    assert structured.fallback.structured_schema is schema
+    assert structured.primary.structured_kwargs == {"method": "json_mode"}
+    assert structured.fallback.structured_kwargs == {"method": "json_mode"}
 
 
 @pytest.mark.asyncio

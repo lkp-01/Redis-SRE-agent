@@ -14,7 +14,7 @@ from langgraph.graph import StateGraph
 
 from redis_sre_agent.agent import chat_agent as chat_agent_module
 from redis_sre_agent.agent._compat import FakeToolCallingLLM
-from redis_sre_agent.agent.chat_agent import ChatAgent, get_chat_agent
+from redis_sre_agent.agent.chat_agent import CHAT_SYSTEM_PROMPT, ChatAgent, get_chat_agent
 from redis_sre_agent.agent.models import AgentResponse
 from redis_sre_agent.core import llm_helpers
 from redis_sre_agent.core import redis as redis_core
@@ -199,6 +199,15 @@ def test_chat_agent_prefers_explicit_llm() -> None:
     agent = ChatAgent(llm=explicit_llm)
 
     assert agent.llm is explicit_llm
+
+
+def test_chat_prompt_preserves_original_target_discovery_rules() -> None:
+    prompt = CHAT_SYSTEM_PROMPT.lower()
+
+    assert "list_known_redis_targets" in prompt
+    assert "resolve_redis_targets" in prompt
+    assert "exact match" in prompt
+    assert "ambiguous" in prompt
 
 
 def test_chat_agent_uses_real_factory_only_when_key_is_configured(monkeypatch) -> None:
