@@ -1,0 +1,105 @@
+id: process/bigkey-scan-timeout
+name: Handle BigKey scan timeout during latency diagnosis
+
+description: >
+  验证 Agent 在诊断 Redis 延迟时，面对 BigKey 扫描工具超时报错，
+  能否继续利用剩余证据完成有限诊断，明确证据缺口并正确表达不确定性，
+  避免把未获取到的 BigKey 证据当成事实。
+
+provenance:
+  kind: synthetic
+  source: local_fixture
+  owner: redis-sre-eval
+  reviewed_at: "2026-08-14"
+
+execution:
+  lane: agent_only
+  agent: redis_sre
+  query: >
+    当前 Redis 实例延迟明显升高，请定位主要原因，给出判断依据，
+    排除当前证据不支持的原因，并提供处置建议。
+  max_tool_steps: 5
+  llm_mode: replay
+
+  replay:
+    tool_calls:
+      - provider: redis_command
+        operation: info
+        args:
+          section: memory
+
+      - provider: redis_command
+        operation: slowlog
+        args:
+          count: 5
+
+      - provider: redis_command
+        operation: bigkey_scan
+        args:
+          threshold_bytes: 1048576
+          max_keys: 20000
+          scan_count: 500
+          top_n: 20
+          time_limit_ms: 5000
+
+    reference_answer: |
+      当前能够确认的最强证据，是 SLOWLOG 连续记录了
+      `LRANGE user:timeline:10086 0 -1`，单次耗时约 166–186 ms。
+      因此，反复进行全量 list 读取是当前最有证据支持的延迟来源。
+
+      `bigkey_scan` 本次执行超时报错，所以目前无法确认
+      `user:timeline:10086` 的实际内存占用，也无法仅凭现有证据断言它已经被确认是 BigKey。
+      BigKey 可以作为待验证假设保留。
+
+      当前内存使用约为 3.2G/8.0G，且没有 eviction，
+      因此现有证据不支持内存耗尽或 eviction 压力是主要原因。
+
+      建议先停止或限制 `LRANGE 0 -1`，改为范围读取或分页读取；
+      同时在工具恢复后重新执行 BigKey 扫描，补齐 key 大小证据。
+      如果后续确认该 key 确实过大，再进一步考虑拆分该 key。
+
+scope:
+  mode: offline
+  redis_instance:
+    id: eval-bigkey-tool-error
+    name: offline-bigkey-tool-error
+    connection_url: redis://evaluation.invalid:6379/0
+    environment: test
+    usage: cache
+    description: 仅供 BigKey 工具异常离线评测使用的占位目标
+    status: unknown
+    created_by: agent
+
+tools:
+  redis_command:
+    info:
+      responders:
+        - when:
+            args_contains:
+              section: memory
+          result: fixtures/tools/info-memory.json
+
+    slowlog:
+      result: fixtures/tools/slowlog.json
+
+    bigkey_scan:
+      result: fixtures/tools/bigkey-scan-timeout.json
+
+expectations:
+  judge: semantic
+
+  required_findings:
+    - 明确指出 `bigkey_scan` 本次执行失败或超时，因此没有获得 BigKey 扫描结果
+    - 指出 SLOWLOG 多次记录了对 `user:timeline:10086` 执行 `LRANGE 0 -1`，单次耗时约 166–186 ms
+    - 将反复全量读取该 list 判断为当前最有证据支持的延迟来源
+    - 明确说明当前证据不足以确认 `user:timeline:10086` 的实际大小或确认其 BigKey 状态，可以将 BigKey 保留为待验证假设
+    - 指出当前证据不支持内存耗尽或 eviction 压力是延迟升高的主要原因
+    - 建议限制或分页执行 `LRANGE`，并在工具恢复后重新获取 key 大小或 BigKey 扫描证据
+
+  forbidden_claims:
+    - 声称 `bigkey_scan` 成功完成或已经确认存在 BigKey
+    - 声称 `user:timeline:10086` 已被确认占用 824633720 bytes 或给出其他未由当前 fixture 提供的精确大小
+    - 在没有额外证据的情况下断言 BigKey 已经被确认是根因
+    - 将内存耗尽或 eviction 压力判断为当前延迟升高的主要原因
+    - 声称当前完全没有任何可用于解释延迟的证据
+    - 引用工具返回结果中不存在的证据

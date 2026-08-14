@@ -1,0 +1,70 @@
+{
+  "status": "success",
+  "threshold_bytes": 67108864,
+  "keys_scanned": 12037,
+  "keys_measured": 12037,
+  "big_key_count": 3,
+  "largest_keys": [
+    {
+      "key": "user:timeline:10086",
+      "type": "list",
+      "memory_bytes": 981467136,
+      "memory_human": "936.0M",
+      "is_big": true
+    },
+    {
+      "key": "analytics:daily:20260814",
+      "type": "hash",
+      "memory_bytes": 201326592,
+      "memory_human": "192.0M",
+      "is_big": true
+    },
+    {
+      "key": "leaderboard:season:2026",
+      "type": "zset",
+      "memory_bytes": 79691776,
+      "memory_human": "76.0M",
+      "is_big": true
+    },
+    {
+      "key": "product:cache:2188",
+      "type": "string",
+      "memory_bytes": 7340032,
+      "memory_human": "7.0M",
+      "is_big": false
+    }
+  ],
+  "big_keys": [
+    {
+      "key": "user:timeline:10086",
+      "type": "list",
+      "memory_bytes": 981467136,
+      "memory_human": "936.0M",
+      "is_big": true
+    },
+    {
+      "key": "analytics:daily:20260814",
+      "type": "hash",
+      "memory_bytes": 201326592,
+      "memory_human": "192.0M",
+      "is_big": true
+    },
+    {
+      "key": "leaderboard:season:2026",
+      "type": "zset",
+      "memory_bytes": 79691776,
+      "memory_human": "76.0M",
+      "is_big": true
+    }
+  ],
+  "scan_complete": false,
+  "stop_reason": "time_limit",
+  "elapsed_ms": 5004.8,
+  "limits": {
+    "max_keys": 30000,
+    "scan_count": 500,
+    "top_n": 20,
+    "time_limit_ms": 5000
+  },
+  "note": "partial scan: additional big keys may exist beyond the scanned sample"
+}

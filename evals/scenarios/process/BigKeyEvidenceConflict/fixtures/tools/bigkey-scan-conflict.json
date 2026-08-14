@@ -1,0 +1,38 @@
+{
+  "status": "success",
+  "threshold_bytes": 1048576,
+  "keys_scanned": 10482,
+  "keys_measured": 10482,
+  "big_key_count": 1,
+  "largest_keys": [
+    {
+      "key": "user:timeline:10086",
+      "type": "list",
+      "memory_bytes": 5368709120,
+      "is_big": true
+    },
+    {
+      "key": "product:cache:2188",
+      "type": "string",
+      "memory_bytes": 18432,
+      "is_big": false
+    }
+  ],
+  "big_keys": [
+    {
+      "key": "user:timeline:10086",
+      "type": "list",
+      "memory_bytes": 5368709120,
+      "is_big": true
+    }
+  ],
+  "scan_complete": true,
+  "stop_reason": "cursor_exhausted",
+  "elapsed_ms": 355.2,
+  "limits": {
+    "max_keys": 20000,
+    "scan_count": 500,
+    "top_n": 20,
+    "time_limit_ms": 5000
+  }
+}

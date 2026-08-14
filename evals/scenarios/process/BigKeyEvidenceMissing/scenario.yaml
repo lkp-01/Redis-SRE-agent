@@ -1,0 +1,82 @@
+id: process/bigkey-critical-evidence-missing
+name: Handle missing critical BigKey evidence
+description: 验证 Agent 在存在明显慢命令、内存偏高和扫描噪声时，面对 BigKey 扫描未完成且关键 key 大小缺失，能否把已证实事实与待验证假设分开。
+provenance:
+  kind: synthetic
+  source: local_fixture
+  owner: redis-sre-eval
+  reviewed_at: '2026-08-14'
+execution:
+  lane: agent_only
+  agent: redis_sre
+  query: Redis 最近偶发卡顿，timeline 接口最明显，另一个同事说可能只是内存接近上限。你看现有数据，告诉我现在能确认什么、最该先处理什么。
+  max_tool_steps: 5
+  llm_mode: replay
+  replay:
+    tool_calls:
+    - provider: redis_command
+      operation: info
+      args:
+        section: memory
+    - provider: redis_command
+      operation: slowlog
+      args:
+        count: 8
+    - provider: redis_command
+      operation: bigkey_scan
+      args:
+        threshold_bytes: 1048576
+        max_keys: 20000
+        scan_count: 500
+        top_n: 20
+        time_limit_ms: 5000
+    reference_answer: |
+      当前最可靠的直接证据，是 SLOWLOG 两次记录 `LRANGE user:timeline:10086 0 -1`，
+      单次约 169–182 ms，因此反复全量读取该 list 已经能够解释一部分当前延迟。
+
+      BigKey 扫描本次只检查了 2500 个 key，并因时间预算停止，`scan_complete=false`。
+      扫描结果中没有出现 `user:timeline:10086`，这既不能证明它是 BigKey，也不能据此排除它是 BigKey；
+      当前缺少的关键证据正是该 key 的实际内存大小或一次完整覆盖它的扫描结果。
+
+      内存约 6.9G/8.0G，容量偏高，但没有 eviction。它值得继续观察，
+      现有证据还不足以把内存压力确定为主要延迟来源。
+
+      优先限制 `LRANGE 0 -1`，改为范围读取或分页读取；随后补采
+      `redis-cli MEMORY USAGE user:timeline:10086 SAMPLES 5` 或完成一次覆盖该 key 的 BigKey 扫描，
+      再决定是否需要拆分该 key。
+scope:
+  mode: offline
+  redis_instance:
+    id: eval-bigkey-evidence-missing
+    name: offline-bigkey-evidence-missing
+    connection_url: redis://evaluation.invalid:6379/0
+    environment: test
+    usage: cache
+    description: 仅供 Handle missing critical BigKey evidence 离线评测使用的占位目标
+    status: unknown
+    created_by: agent
+tools:
+  redis_command:
+    info:
+      responders:
+      - when:
+          args_contains:
+            section: memory
+        result: fixtures/tools/info-memory.json
+    slowlog:
+      result: fixtures/tools/slowlog.json
+    bigkey_scan:
+      result: fixtures/tools/bigkey-scan-partial.json
+expectations:
+  judge: semantic
+  required_findings:
+  - 指出 SLOWLOG 已经直接证明 `user:timeline:10086` 的全量 `LRANGE 0 -1` 很慢，并将其视为当前最强的延迟证据
+  - 明确指出 BigKey 扫描未完成，因此当前缺少 `user:timeline:10086` 的实际大小证据，不能确认也不能排除其 BigKey 状态
+  - 说明 6.9G/8.0G 的内存占用值得关注，但没有 eviction，现有证据不足以把内存压力确定为主要原因
+  - 给出补齐关键证据的下一步，例如查询该 key 的 MEMORY USAGE 或完成覆盖该 key 的扫描
+  forbidden_claims:
+  - 声称 `user:timeline:10086` 已经被确认是 BigKey
+  - 因为扫描结果没有出现 `user:timeline:10086` 就断言它不是 BigKey
+  - 编造 `user:timeline:10086` 的精确内存大小
+  - 将内存压力确定为当前延迟升高的主要原因
+  - 声称当前没有任何可以解释延迟的证据

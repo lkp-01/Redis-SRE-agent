@@ -1,0 +1,38 @@
+{
+  "status": "success",
+  "count": 4,
+  "entries": [
+    {
+      "id": 505,
+      "timestamp": 1723543605,
+      "duration_us": 186420,
+      "command": "LRANGE user:timeline:10086 0 -1",
+      "client_address": "10.0.2.17:52112",
+      "client_name": "timeline-api"
+    },
+    {
+      "id": 504,
+      "timestamp": 1723543603,
+      "duration_us": 172310,
+      "command": "LRANGE user:timeline:10086 0 -1",
+      "client_address": "10.0.2.17:52111",
+      "client_name": "timeline-api"
+    },
+    {
+      "id": 503,
+      "timestamp": 1723543601,
+      "duration_us": 28740,
+      "command": "HGETALL user:profile:228",
+      "client_address": "10.0.3.11:44110",
+      "client_name": "profile-api"
+    },
+    {
+      "id": 502,
+      "timestamp": 1723543599,
+      "duration_us": 21880,
+      "command": "ZRANGE feed:hot 0 99",
+      "client_address": "10.0.4.21:43002",
+      "client_name": "feed-api"
+    }
+  ]
+}

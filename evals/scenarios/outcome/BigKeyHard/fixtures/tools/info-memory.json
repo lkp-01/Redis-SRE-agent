@@ -1,0 +1,15 @@
+{
+  "status": "success",
+  "section": "memory",
+  "data": {
+    "used_memory": 7408818585,
+    "used_memory_human": "6.9G",
+    "used_memory_rss": 7730941133,
+    "used_memory_rss_human": "7.2G",
+    "maxmemory": 8589934592,
+    "maxmemory_human": "8.0G",
+    "maxmemory_policy": "allkeys-lru",
+    "mem_fragmentation_ratio": 1.04,
+    "mem_not_counted_for_evict": 85983232
+  }
+}

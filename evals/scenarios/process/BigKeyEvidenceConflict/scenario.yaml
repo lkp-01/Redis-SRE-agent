@@ -1,0 +1,79 @@
+id: process/bigkey-conflicting-evidence
+name: Reconcile conflicting BigKey evidence
+description: 验证 Agent 能否识别工具证据之间的数量级矛盾：单个 key 的报告大小超过 Redis 当前总 used_memory，同时仍保留 SLOWLOG 中独立成立的慢命令事实。
+provenance:
+  kind: synthetic
+  source: local_fixture
+  owner: redis-sre-eval
+  reviewed_at: '2026-08-14'
+execution:
+  lane: agent_only
+  agent: redis_sre
+  query: 昨晚开始 Redis p99 抖到 200ms 左右，业务侧只说 timeline 请求受影响比较明显。你按现有证据给一个能站得住脚的结论，别把可能性说成事实。
+  max_tool_steps: 5
+  llm_mode: replay
+  replay:
+    tool_calls:
+    - provider: redis_command
+      operation: info
+      args:
+        section: memory
+    - provider: redis_command
+      operation: slowlog
+      args:
+        count: 8
+    - provider: redis_command
+      operation: bigkey_scan
+      args:
+        threshold_bytes: 1048576
+        max_keys: 20000
+        scan_count: 500
+        top_n: 20
+        time_limit_ms: 5000
+    reference_answer: |
+      SLOWLOG 连续记录 `LRANGE user:timeline:10086 0 -1`，单次约 177–187 ms，
+      所以对该 list 的全量读取确实是当前有直接证据支持的慢操作。
+
+      BigKey 扫描声称 `user:timeline:10086` 占用 5368709120 bytes（5 GiB），
+      而 INFO memory 同时显示 Redis 总 used_memory 只有约 3.2G。
+      在同一时点，单个 key 大于整个实例已用内存无法直接成立，因此这两份证据存在明显冲突；
+      可能涉及快照时点差异、采集异常或数据失真，当前不能把 5 GiB 这个精确值当作事实。
+
+      因此可以确认“全量 LRANGE 很慢”，也可以把 BigKey 保留为高优先级待验证假设，
+      但需要重新获取一致时点的内存证据后再确认 key 大小和 BigKey 状态。
+scope:
+  mode: offline
+  redis_instance:
+    id: eval-bigkey-evidence-conflict
+    name: offline-bigkey-evidence-conflict
+    connection_url: redis://evaluation.invalid:6379/0
+    environment: test
+    usage: cache
+    description: 仅供 Reconcile conflicting BigKey evidence 离线评测使用的占位目标
+    status: unknown
+    created_by: agent
+tools:
+  redis_command:
+    info:
+      responders:
+      - when:
+          args_contains:
+            section: memory
+        result: fixtures/tools/info-memory.json
+    slowlog:
+      result: fixtures/tools/slowlog.json
+    bigkey_scan:
+      result: fixtures/tools/bigkey-scan-conflict.json
+expectations:
+  judge: semantic
+  required_findings:
+  - 明确识别出单个 key 被报告为 5368709120 bytes、而实例总 used_memory 只有约 3.2G，两份证据存在无法直接调和的冲突
+  - 保留 SLOWLOG 中 `LRANGE user:timeline:10086 0 -1` 约 177–187 ms 这一独立成立的慢命令事实
+  - 在证据冲突解决前，不把 5368709120 bytes 的精确大小或 BigKey 根因结论当作已确认事实
+  - 建议重新采集同一时点的 key 大小与实例内存证据以消解冲突
+  forbidden_claims:
+  - 无条件接受 `user:timeline:10086` 占用 5368709120 bytes 为可靠事实
+  - 因为 BigKey 扫描声称 5 GiB 就直接确认 BigKey 是唯一根因
+  - 忽略 INFO memory 与 BigKey 扫描之间的数量级矛盾
+  - 为了消除冲突而编造某一个工具结果错误或过期
+  - 声称 SLOWLOG 中的全量 LRANGE 并不慢

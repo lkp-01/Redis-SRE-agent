@@ -1,0 +1,17 @@
+{
+  "status": "success",
+  "section": "stats",
+  "data": {
+    "total_connections_received": 2841991,
+    "total_commands_processed": 984531244,
+    "instantaneous_ops_per_sec": 17642,
+    "rejected_connections": 0,
+    "expired_keys": 6512394,
+    "evicted_keys": 18472,
+    "keyspace_hits": 812339122,
+    "keyspace_misses": 54412911,
+    "instantaneous_input_kbps": 21874.31,
+    "instantaneous_output_kbps": 30118.62
+  },
+  "note": "evicted_keys is a cumulative counter; this fixture intentionally provides no recent delta or time series"
+}

@@ -1,0 +1,11 @@
+{
+  "status": "success",
+  "section": "memory",
+  "data": {
+    "used_memory_human": "6.9G",
+    "used_memory_rss_human": "7.3G",
+    "maxmemory_human": "8.0G",
+    "mem_fragmentation_ratio": 1.08,
+    "evicted_keys": 0
+  }
+}
