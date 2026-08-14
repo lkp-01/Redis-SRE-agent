@@ -1,0 +1,125 @@
+# 场景唯一 ID。
+id: outcome/replica-lag-output-buffer
+# 人类可读名称。
+name: Diagnose master buffer growth caused by a slow replica
+# Judge 使用的场景说明。
+description: >
+  验证 Agent 能否把从节点复制延迟、主从 offset 差距、replica CLIENT LIST 输出缓冲区
+  和 MEMORY STATS clients.slaves 内存关联起来。
+
+# 来源与维护信息。
+provenance:
+  # 人工构造案例。
+  kind: synthetic
+  # 本地 fixture 证据。
+  source: local_fixture
+  # 维护者角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 运行定义。
+execution:
+  # 直接运行 Agent。
+  lane: agent_only
+  # Redis SRE Agent。
+  agent: redis_sre
+  # 用户问题。
+  query: >
+    主节点内存持续上涨，一台从节点复制很慢。请判断是否是从节点拖慢导致主节点
+    replica output buffer 膨胀，给出具体证据和处置建议。
+  # 工具预算。
+  max_tool_steps: 5
+  # 固定离线 replay。
+  llm_mode: replay
+  # 三次工具调用和参考答案。
+  replay:
+    # 必须依次执行的调用。
+    tool_calls:
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取主从 offset 和 lag。
+        operation: replication_info
+        # 无参数。
+        args: {}
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取 replica 客户端输出缓冲区。
+        operation: client_list
+        # CLIENT LIST 参数。
+        args:
+          # 仅查看 replica 类型。
+          client_type: replica
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取内存分类。
+        operation: memory_stats
+        # 无参数。
+        args: {}
+    # Judge 对照答案。
+    reference_answer: |
+      主节点内存上涨主要来自慢从节点的复制输出缓冲区。replication_info 显示
+      10.50.0.22 的 lag=45 秒，offset 比 master_repl_offset 落后约 512 MiB；
+      CLIENT LIST TYPE replica 中该连接 omem=1719664640、oll=26240、events=w。
+      MEMORY STATS 的 clients.slaves 约 1.72 GiB，而 clients.normal 仅约 24 MiB，
+      证据明确指向 replica buffer 而不是普通客户端。应检查从节点 CPU、磁盘和网络，
+      降低主库写入或隔离故障从库，评估 backlog/全量重同步风险，并设置 replica 类
+      client-output-buffer-limit 和 lag/buffer 告警；不要只给主节点扩内存而忽略慢从库。
+
+# 离线目标范围。
+scope:
+  # fixture-only 模式。
+  mode: offline
+  # 唯一 Redis 目标。
+  redis_instance:
+    # 实例 ID。
+    id: eval-replica-lag-output-buffer
+    # 实例名称。
+    name: offline-replica-lag-output-buffer
+    # 占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 测试环境。
+    environment: test
+    # 诊断用途。
+    usage: diagnostics
+    # 实例说明。
+    description: 慢从节点导致主节点复制缓冲区膨胀的离线评测目标
+    # 未知状态。
+    status: unknown
+    # 由 Agent 创建。
+    created_by: agent
+
+# provider fixture 映射。
+tools:
+  # Redis 命令 fixture。
+  redis_command:
+    # replication_info 响应。
+    replication_info:
+      # fixture 路径。
+      result: fixtures/tools/replication-info.json
+    # CLIENT LIST replica 响应。
+    client_list:
+      # fixture 路径。
+      result: fixtures/tools/client-list-replica.json
+    # MEMORY STATS 响应。
+    memory_stats:
+      # fixture 路径。
+      result: fixtures/tools/memory-stats.json
+
+# 语义期望。
+expectations:
+  # 使用语义 Judge。
+  judge: semantic
+  # 必须覆盖的发现。
+  required_findings:
+    - 指出从节点 10.50.0.22 落后 45 秒且 offset 差距约为 512 MiB
+    - 指出该 replica 连接 omem 为 1719664640、oll 为 26240 且 events=w
+    - 将 clients.slaves 约 1.72 GiB 与主节点内存上涨关联起来
+    - 建议排查从节点 CPU、磁盘和网络，并设置 replica buffer limit 与 lag 告警
+  # 禁止的错误结论。
+  forbidden_claims:
+    - 把 clients.slaves 字节数解释为从节点数量
+    - 将普通客户端输出缓冲区判断为当前主因
+    - 只建议扩大主节点内存而不处理慢从节点
+
+# 不注入 knowledge 或 memory。

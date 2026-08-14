@@ -28,6 +28,7 @@ _EXPECTED_REDIS_OPERATIONS = {
     "cluster_info",
     "replication_info",
     "memory_stats",
+    "bigkey_scan",
     "sample_keys",
     "search_indexes",
     "search_index_info",

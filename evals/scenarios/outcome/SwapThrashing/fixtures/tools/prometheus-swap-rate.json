@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "query": "rate(node_vmstat_pswpin[5m]) or rate(node_vmstat_pswpout[5m]) or redis_commands_duration_seconds",
+  "start_time": "30m",
+  "end_time": "now",
+  "step": "30s",
+  "data": [
+    {"metric": {"__name__": "node_vmstat_pswpin", "rate": "5m"}, "values": [[1723600000, "12"], [1723600900, "3180"], [1723601800, "4460"]]},
+    {"metric": {"__name__": "node_vmstat_pswpout", "rate": "5m"}, "values": [[1723600000, "8"], [1723600900, "2790"], [1723601800, "3910"]]},
+    {"metric": {"__name__": "redis_commands_duration_seconds", "quantile": "0.99"}, "values": [[1723600000, "0.002"], [1723600900, "0.820"], [1723601800, "1.640"]]}
+  ],
+  "timestamp": "2026-08-14T08:00:00Z"
+}

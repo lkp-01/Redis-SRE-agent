@@ -1,0 +1,148 @@
+# 场景唯一 ID。
+id: outcome/fork-memory-spike
+# 人类可读名称。
+name: Diagnose RSS growth caused by Redis fork copy-on-write
+# Judge 使用的场景说明。
+description: >
+  验证 Agent 能否识别 BGSAVE/AOF rewrite fork 期间写流量触发的 copy-on-write RSS 增长，
+  并区别于 dataset 持续增长或普通内存泄漏。
+
+# 来源和维护责任。
+provenance:
+  # 人工构造案例。
+  kind: synthetic
+  # 本地 fixture。
+  source: local_fixture
+  # 维护者角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 运行定义。
+execution:
+  # 直接执行 Agent。
+  lane: agent_only
+  # Redis SRE Agent。
+  agent: redis_sre
+  # 用户问题。
+  query: >
+    Redis used_memory 基本稳定，但进程 RSS 在后台保存期间快速上涨。请定位原因、
+    给出 fork/COW 证据，并说明如何降低 OOM 风险。
+  # 工具预算。
+  max_tool_steps: 5
+  # 固定离线 replay。
+  llm_mode: replay
+  # 三次调用与 Judge 参考答案。
+  replay:
+    # 必须执行的调用。
+    tool_calls:
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取持久化与 fork 状态。
+        operation: info
+        # INFO 参数。
+        args:
+          # persistence section。
+          section: persistence
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取 Redis 内存和 RSS。
+        operation: info
+        # INFO 参数。
+        args:
+          # memory section。
+          section: memory
+      # Prometheus provider。
+      - provider: prometheus
+        # 查询 used memory、RSS 与写速率趋势。
+        operation: query_range
+        # PromQL 和范围参数。
+        args:
+          # 对比逻辑内存、RSS和写速率。
+          query: 'redis_memory_used_bytes or process_resident_memory_bytes or rate(redis_commands_processed_total{cmd="set"}[1m])'
+          # 最近 30 分钟。
+          start_time: 30m
+          # 当前结束。
+          end_time: now
+          # 30 秒采样。
+          step: 30s
+    # Judge 参考答案。
+    reference_answer: |
+      RSS 上涨与后台 fork 的 copy-on-write 最吻合。INFO persistence 显示
+      rdb_bgsave_in_progress=1、current_cow_size=5368709120、current_cow_peak=5583457484，
+      INFO memory 中 used_memory 约 8.1 GiB而 RSS 约 13.4 GiB。Prometheus 显示
+      used_memory 基本稳定，但在写速率维持高位和 BGSAVE 窗口内 RSS 增加约 5 GiB。
+      建议为 fork 预留足够内存余量，降低或错峰写入与后台保存，检查 THP，并评估持久化
+      周期；OOM 紧急风险下再按恢复计划处置后台任务。现有证据不支持 dataset 暴涨或永久泄漏。
+
+# 离线目标范围。
+scope:
+  # 所有工具走 fixture。
+  mode: offline
+  # 唯一 Redis 目标。
+  redis_instance:
+    # 实例 ID。
+    id: eval-fork-memory-spike
+    # 实例名称。
+    name: offline-fork-memory-spike
+    # 占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 测试环境。
+    environment: test
+    # 诊断用途。
+    usage: diagnostics
+    # 目标说明。
+    description: fork copy-on-write RSS 增长的离线评测目标
+    # 不预设状态。
+    status: unknown
+    # 由 Agent 创建。
+    created_by: agent
+
+# provider fixture 映射。
+tools:
+  # Redis 命令 fixture。
+  redis_command:
+    # INFO 根据 section 选择不同 fixture。
+    info:
+      # 条件响应列表。
+      responders:
+        # persistence section 响应。
+        - when:
+            # 参数包含条件。
+            args_contains:
+              # 匹配 persistence。
+              section: persistence
+          # 对应 fixture。
+          result: fixtures/tools/info-persistence.json
+        # memory section 响应。
+        - when:
+            # 参数包含条件。
+            args_contains:
+              # 匹配 memory。
+              section: memory
+          # 对应 fixture。
+          result: fixtures/tools/info-memory.json
+  # Prometheus fixture。
+  prometheus:
+    # 范围查询响应。
+    query_range:
+      # fixture 路径。
+      result: fixtures/tools/prometheus-fork-memory.json
+
+# 语义期望。
+expectations:
+  # 使用语义 Judge。
+  judge: semantic
+  # 必须覆盖的发现。
+  required_findings:
+    - 指出 BGSAVE 正在进行且 current_cow_size 为 5368709120 bytes
+    - 对比约 8.1 GiB 的 used_memory 与约 13.4 GiB 的 RSS
+    - 将稳定 dataset、持续写流量和 fork 窗口内 RSS 上涨关联为 copy-on-write
+    - 建议预留 fork 内存、错峰后台保存或降低写入，并检查 THP
+  # 禁止的错误结论。
+  forbidden_claims:
+    - 断言 dataset 增长约 5 GiB
+    - 把瞬时 COW 峰值直接定性为永久内存泄漏
+    - 在不考虑恢复和持久化影响时直接终止后台任务
+
+# 不注入 knowledge 或 memory。

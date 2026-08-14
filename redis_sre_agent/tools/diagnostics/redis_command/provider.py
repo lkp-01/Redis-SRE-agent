@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import heapq
 import logging
 import re
 import time
@@ -312,6 +313,56 @@ class RedisCommandToolProvider(ToolProvider):
                 parameters={"type": "object", "properties": {}, "required": []},
             ),
             ToolDefinition(
+                name=self._make_tool_name("bigkey_scan"),
+                description=(
+                    "Safely scan the current Redis database for large keys using cursor-based "
+                    "SCAN and MEMORY USAGE. Returns the largest measured keys and keys above "
+                    "a byte threshold. The scan is bounded by key and time budgets and never "
+                    "uses KEYS."
+                ),
+                capability=ToolCapability.DIAGNOSTICS,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "threshold_bytes": {
+                            "type": "integer",
+                            "description": "Size in bytes at or above which a key is considered big (default: 1048576).",
+                            "default": 1048576,
+                            "minimum": 0,
+                        },
+                        "max_keys": {
+                            "type": "integer",
+                            "description": "Maximum unique keys to inspect (default: 10000; hard maximum: 100000).",
+                            "default": 10000,
+                            "minimum": 1,
+                            "maximum": 100000,
+                        },
+                        "scan_count": {
+                            "type": "integer",
+                            "description": "SCAN COUNT hint per batch (default: 500; hard maximum: 2000).",
+                            "default": 500,
+                            "minimum": 1,
+                            "maximum": 2000,
+                        },
+                        "top_n": {
+                            "type": "integer",
+                            "description": "Number of largest keys to return (default: 20; hard maximum: 100).",
+                            "default": 20,
+                            "minimum": 1,
+                            "maximum": 100,
+                        },
+                        "time_limit_ms": {
+                            "type": "integer",
+                            "description": "Approximate scan time budget in milliseconds (default: 5000; hard maximum: 30000).",
+                            "default": 5000,
+                            "minimum": 100,
+                            "maximum": 30000,
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
                 name=self._make_tool_name("sample_keys"),
                 description=(
                     "Sample random keys from the Redis keyspace with minimal impact using RANDOMKEY. "
@@ -404,6 +455,8 @@ class RedisCommandToolProvider(ToolProvider):
             return "client_list"
         if op == "stats" and "memory" in tool_name:
             return "memory_stats"
+        if op == "scan" and "bigkey" in tool_name:
+            return "bigkey_scan"
         if op == "keys":
             return "sample_keys"
         if op == "indexes":
@@ -602,6 +655,146 @@ class RedisCommandToolProvider(ToolProvider):
                 }
 
             logger.error("Failed to execute MEMORY STATS: %s", error)
+            return {"status": "error", "error": error}
+
+    @status_update("I'm scanning Redis for large keys within a bounded safety budget.")
+    async def bigkey_scan(
+        self,
+        threshold_bytes: int = 1024 * 1024,
+        max_keys: int = 10_000,
+        scan_count: int = 500,
+        top_n: int = 20,
+        time_limit_ms: int = 5_000,
+    ) -> Dict[str, Any]:
+        """Find memory-heavy keys without blocking Redis with KEYS."""
+        try:
+            threshold = max(0, int(threshold_bytes))
+            key_budget = max(1, min(int(max_keys), 100_000))
+            count_hint = max(1, min(int(scan_count), 2_000))
+            result_limit = max(1, min(int(top_n), 100))
+            time_budget_ms = max(100, min(int(time_limit_ms), 30_000))
+        except (TypeError, ValueError) as exc:
+            return {
+                "status": "error",
+                "error_type": "invalid_parameters",
+                "error": _safe_error_message(exc),
+            }
+
+        logger.info(
+            "Scanning for big keys (threshold_bytes=%s, max_keys=%s, time_limit_ms=%s)",
+            threshold,
+            key_budget,
+            time_budget_ms,
+        )
+        client = self.get_client()
+        started = time.monotonic()
+        cursor = 0
+        seen: set[str] = set()
+        keys_measured = 0
+        big_key_count = 0
+        sequence = 0
+        largest_heap: list[tuple[int, int, Dict[str, Any]]] = []
+        big_heap: list[tuple[int, int, Dict[str, Any]]] = []
+        stop_reason = "cursor_exhausted"
+        scan_complete = False
+
+        def retain_largest(
+            heap: list[tuple[int, int, Dict[str, Any]]],
+            item: Dict[str, Any],
+        ) -> None:
+            nonlocal sequence
+            sequence += 1
+            entry = (item["memory_bytes"], sequence, item)
+            if len(heap) < result_limit:
+                heapq.heappush(heap, entry)
+            elif entry[0] > heap[0][0]:
+                heapq.heapreplace(heap, entry)
+
+        try:
+            while True:
+                if (time.monotonic() - started) * 1000 >= time_budget_ms:
+                    stop_reason = "time_limit_reached"
+                    break
+
+                cursor, keys = await client.scan(cursor=cursor, count=count_hint)
+                fresh_keys: list[str] = []
+                budget_hit = False
+                for raw_key in keys:
+                    key = str(raw_key)
+                    if key in seen:
+                        continue
+                    if len(seen) >= key_budget:
+                        budget_hit = True
+                        break
+                    seen.add(key)
+                    fresh_keys.append(key)
+
+                if fresh_keys:
+                    pipe = client.pipeline(transaction=False)
+                    for key in fresh_keys:
+                        pipe.type(key)
+                        pipe.memory_usage(key, samples=5)
+                    measurements = await pipe.execute()
+
+                    for index, key in enumerate(fresh_keys):
+                        key_type = measurements[index * 2]
+                        memory_bytes = measurements[index * 2 + 1]
+                        if memory_bytes is None:
+                            continue
+                        size = int(memory_bytes)
+                        keys_measured += 1
+                        item = {
+                            "key": key,
+                            "type": str(key_type),
+                            "memory_bytes": size,
+                            "is_big": size >= threshold,
+                        }
+                        retain_largest(largest_heap, item)
+                        if item["is_big"]:
+                            big_key_count += 1
+                            retain_largest(big_heap, item)
+
+                if budget_hit:
+                    stop_reason = "max_keys_reached"
+                    break
+                if int(cursor) == 0:
+                    scan_complete = True
+                    stop_reason = "cursor_exhausted"
+                    break
+                if len(seen) >= key_budget:
+                    stop_reason = "max_keys_reached"
+                    break
+
+            largest_keys = [entry[2] for entry in sorted(largest_heap, reverse=True)]
+            big_keys = [entry[2] for entry in sorted(big_heap, reverse=True)]
+            return {
+                "status": "success",
+                "threshold_bytes": threshold,
+                "keys_scanned": len(seen),
+                "keys_measured": keys_measured,
+                "big_key_count": big_key_count,
+                "largest_keys": largest_keys,
+                "big_keys": big_keys,
+                "scan_complete": scan_complete,
+                "stop_reason": stop_reason,
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+                "limits": {
+                    "max_keys": key_budget,
+                    "scan_count": count_hint,
+                    "top_n": result_limit,
+                    "time_limit_ms": time_budget_ms,
+                },
+            }
+        except Exception as exc:
+            error = _safe_error_message(exc)
+            if _is_command_unavailable_error(exc):
+                logger.warning("Big-key scan unavailable on this Redis instance: %s", error)
+                return {
+                    "status": "error",
+                    "error": error,
+                    "error_type": "unsupported_command",
+                }
+            logger.error("Failed to scan Redis for big keys: %s", error)
             return {"status": "error", "error": error}
 
     @status_update("I'm sampling random keys from the Redis keyspace (count: {count}).")

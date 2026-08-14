@@ -124,8 +124,8 @@ git commit -m "test: lock redis diagnostic provider baseline"
 
 参考：
 
-- `original-redis-sre-agent-main/tests/unit/tools/metrics/test_prometheus_provider.py`
-- `original-redis-sre-agent-main/tests/unit/tools/metrics/test_prometheus_search_retry.py`
+- `origina/tests/unit/tools/metrics/test_prometheus_provider.py`
+- `origina/tests/unit/tools/metrics/test_prometheus_search_retry.py`
 
 覆盖：
 
@@ -169,7 +169,7 @@ Expected: 因 `redis_sre_agent.tools.metrics.prometheus` 尚不存在而失败�
 
 **Step 2: 复制并最小适配 provider**
 
-Source: `original-redis-sre-agent-main/redis_sre_agent/tools/metrics/prometheus/provider.py`
+Source: `origina/redis_sre_agent/tools/metrics/prometheus/provider.py`
 
 保持：
 
@@ -268,7 +268,7 @@ Expected: Prometheus ready，查询响应的 `status` 为 `success`。
 
 **Step 1: 从参考项目最小适配测试**
 
-Source: `original-redis-sre-agent-main/tests/unit/tools/logs/loki/test_loki_provider.py`
+Source: `origina/tests/unit/tools/logs/loki/test_loki_provider.py`
 
 第一组先覆盖 5 个基础工具：`query`、`query_range`、`labels`、`label_values`、`series`。第二组覆盖 `volume`、`patterns`。
 
@@ -308,7 +308,7 @@ Run:
 
 **Step 2: 复制并最小适配 provider**
 
-Source: `original-redis-sre-agent-main/redis_sre_agent/tools/logs/loki/provider.py`
+Source: `origina/redis_sre_agent/tools/logs/loki/provider.py`
 
 保持 7 个 schema、时间解析、空 selector 修复、实例扩展配置和 HTTP API 路径。只适配裁剪项目已有协议与脱敏错误边界，不提前加入认证插件、重试框架或日志写入。
 

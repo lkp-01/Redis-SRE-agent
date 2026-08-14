@@ -1,0 +1,135 @@
+# 场景唯一 ID，用于报告、CLI 和 session 隔离。
+id: outcome/connection-ready-storm
+# 人类可读名称，概括被测故障。
+name: Diagnose latency from a storm of ready client connections
+# Judge 使用的场景目标说明。
+description: >
+  验证 Agent 能否识别大量客户端连接同时处于读就绪状态给 Redis 单线程事件循环
+  带来的调度压力，并区分“连接很多”与“maxclients 拒绝连接”。
+
+# 记录场景证据的来源和复核责任。
+provenance:
+  # synthetic 表示人工构造的可重复案例。
+  kind: synthetic
+  # fixture 是本场景的直接证据来源。
+  source: local_fixture
+  # 维护与复核该基准的角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 定义 Agent、问题和固定工具 transcript。
+execution:
+  # 直接运行被测 Agent。
+  lane: agent_only
+  # 选择 Redis SRE Agent。
+  agent: redis_sre
+  # 发送给 Agent 的故障问题。
+  query: >
+    Redis 请求延迟突然升高，同时接入连接数暴涨。请判断主要原因、给出证据，
+    区分是否触发 maxclients，并提供处置建议。
+  # 允许的工具调用预算。
+  max_tool_steps: 5
+  # 按固定顺序离线重放工具调用。
+  llm_mode: replay
+  # 固定工具调用和 Judge 参考答案。
+  replay:
+    # Agent 必须依次观察的三组证据。
+    tool_calls:
+      # Redis 原生命令工具家族。
+      - provider: redis_command
+        # 获取连接统计。
+        operation: info
+        # INFO clients 参数。
+        args:
+          # 查询 clients section。
+          section: clients
+      # Redis 原生命令工具家族。
+      - provider: redis_command
+        # 获取连接明细和事件标志。
+        operation: client_list
+        # 空参数表示列出全部类型连接。
+        args: {}
+      # Prometheus 指标工具家族。
+      - provider: prometheus
+        # 查询连接数和 Redis 延迟趋势。
+        operation: query_range
+        # PromQL、时间范围和采样步长。
+        args:
+          # 同时返回连接数、拒绝连接数与命令延迟趋势。
+          query: 'redis_connected_clients or redis_rejected_connections_total or redis_commands_duration_seconds'
+          # 查询最近 30 分钟。
+          start_time: 30m
+          # 结束时间为当前时刻。
+          end_time: now
+          # 每 30 秒一个样本。
+          step: 30s
+    # 仅供 Judge 对照，不直接返回给被测 Agent。
+    reference_answer: |
+      当前最有证据支持的主因是连接就绪风暴，而不是 maxclients 拒绝连接。
+      INFO clients 显示 connected_clients 从约 2,000 增至 18,240；Prometheus 中
+      rejected_connections 仍为 0。CLIENT LIST 样本中绝大多数连接 events=r、idle=0，
+      表明大量连接同时等待 Redis 读取处理。Prometheus 显示连接上升与命令延迟
+      从约 1.8 ms 升到 42 ms 同时发生。建议先限流并分批接入，复用连接池、
+      排查产生连接风暴的客户端，并为连接数和 ready 事件设置容量告警；
+      不应只提高 maxclients，因为当前没有拒绝连接证据。
+
+# 限定本场景可操作的离线 Redis 目标。
+scope:
+  # 所有工具响应必须来自 fixture。
+  mode: offline
+  # 绑定的唯一 Redis 实例。
+  redis_instance:
+    # 实例唯一 ID。
+    id: eval-connection-ready-storm
+    # 实例显示名称。
+    name: offline-connection-ready-storm
+    # 不会实际连接的占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 目标环境。
+    environment: test
+    # 目标用途。
+    usage: diagnostics
+    # 目标说明。
+    description: 大量连接同时 ready 的离线评测目标
+    # 不预设健康状态。
+    status: unknown
+    # 占位实例由评测 Agent 创建。
+    created_by: agent
+
+# 声明每个 provider/operation 的离线响应。
+tools:
+  # Redis 命令 fixture。
+  redis_command:
+    # INFO clients 响应。
+    info:
+      # fixture 相对路径。
+      result: fixtures/tools/info-clients.json
+    # CLIENT LIST 响应。
+    client_list:
+      # fixture 相对路径。
+      result: fixtures/tools/client-list.json
+  # Prometheus fixture。
+  prometheus:
+    # 范围查询响应。
+    query_range:
+      # fixture 相对路径。
+      result: fixtures/tools/prometheus-connection-latency.json
+
+# 定义语义通过条件。
+expectations:
+  # 使用 LLM Judge 判断诊断语义。
+  judge: semantic
+  # 回答必须覆盖的结论。
+  required_findings:
+    - 指出 connected_clients 升至 18240，且大量连接处于 events=r、idle=0 的就绪状态
+    - 将大量同时 ready 的连接与 Redis 事件循环调度压力和延迟升高关联起来
+    - 指出 rejected_connections 为 0，当前证据不支持 maxclients 拒绝连接是主因
+    - 建议限流、错峰接入、复用连接池并定位制造连接风暴的客户端
+  # 回答不得包含的错误结论。
+  forbidden_claims:
+    - 仅凭连接数高就断言 Redis 已经触发 maxclients
+    - 建议只提高 maxclients 而不控制连接风暴
+    - 声称没有连接就绪压力的证据
+
+# 本场景不注入 knowledge 或用户 memory，只评估工具证据推理。

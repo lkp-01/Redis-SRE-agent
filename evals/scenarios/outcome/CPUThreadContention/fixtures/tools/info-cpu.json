@@ -1,0 +1,14 @@
+{
+  "status": "success",
+  "section": "cpu",
+  "data": {
+    "used_cpu_sys": 882104.31,
+    "used_cpu_user": 1924811.84,
+    "used_cpu_sys_children": 14221.08,
+    "used_cpu_user_children": 18202.41,
+    "used_cpu_sys_main_thread": 841103.20,
+    "used_cpu_user_main_thread": 1804200.71,
+    "used_cpu_sys_io_threads": 41001.11,
+    "used_cpu_user_io_threads": 120611.13
+  }
+}

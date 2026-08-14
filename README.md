@@ -1,6 +1,6 @@
 # Redis SRE Agent 诊断切片
 
-这是 `original-redis-sre-agent-main` 的裁剪复刻项目。Stage 8 在既有 Stage 5
+这是 `origina` 的裁剪复刻项目。Stage 8 在既有 Stage 5
 诊断主链上恢复了可选的最小 RAG 闭环；Stage 9 又接入受信任配置中的外部 MCP Client
 只读切片。两者都保留 original 的文件边界、ToolManager 路由和 StateGraph 控制流。
 
@@ -30,11 +30,11 @@ Click LazyGroup -> cli/query.py -> Redis Thread -> router
 
 | Provider | 工具数 | 用途 |
 | --- | ---: | --- |
-| Redis Command | 11 | 直接读取 Redis INFO、慢日志、客户端、内存和拓扑等证据 |
+| Redis Command | 12 | 直接读取 Redis INFO、慢日志、客户端、内存和拓扑等证据 |
 | Prometheus | 3 | 查询当前指标、范围指标和可用指标名 |
 | Loki | 7 | 查询日志、标签、日志流、容量和日志模式 |
 
-每个目标合计 21 个工具。Provider 构造和 Agent 启动不会主动连接 Prometheus 或 Loki，
+每个目标合计 22 个工具。Provider 构造和 Agent 启动不会主动连接 Prometheus 或 Loki，
 只有实际调用相应工具时才发出请求。未配置外部服务时，Redis Command 诊断仍可运行；
 Prometheus 或 Loki 调用会返回局部、脱敏的结构化连接错误。
 
@@ -204,5 +204,8 @@ python -m pytest -o addopts="" -q -m integration tests/integration/test_rag_redi
 
 本阶段不恢复独立 Knowledge Agent、LLM ingest 工具、Hybrid/RRF/reranker、skills、
 support tickets、knowledge pack、网页/PDF ingestion、MCP pool/write approval/server、
-API、worker、scheduler、完整 eval、OpenTelemetry 或 UI。Click `LazyGroup`、Chat/Triage
+API、worker、scheduler、完整 eval 平台、OpenTelemetry 或 UI。当前保留 BigKey replay、
+结构化硬断言和 LLM judge；尚未恢复 live suite 和报告落盘链路。场景使用 `judge: semantic`
+时，`redis-sre-agent eval run evals/scenarios/outcome/BigKey/scenario.yaml --json` 会调用配置的
+mini 模型完成语义评分。测试必须注入 fake judge，不访问真实 OpenAI。Click `LazyGroup`、Chat/Triage
 StateGraph、Thread 持久化、target binding 和 Redis 只读诊断行为保持既有边界。

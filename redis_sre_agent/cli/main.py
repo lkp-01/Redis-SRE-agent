@@ -25,6 +25,7 @@ configure_cli_logging()
 
 # 定义动态加载（懒加载）的命令映射表，Key 为命令行命令，Value 为实际代码文件和函数的路径字符串
 _COMMANDS = {
+    "eval": "redis_sre_agent.cli.eval:eval",
     "knowledge": "redis_sre_agent.cli.knowledge:knowledge",
     "pipeline": "redis_sre_agent.cli.pipeline:pipeline",
     "query": "redis_sre_agent.cli.query:query",

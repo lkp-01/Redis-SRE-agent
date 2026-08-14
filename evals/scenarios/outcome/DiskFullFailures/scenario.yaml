@@ -1,0 +1,139 @@
+# 场景唯一 ID。
+id: outcome/disk-full-failures
+# 人类可读名称。
+name: Diagnose Redis failures caused by a full persistence disk
+# Judge 使用的场景说明。
+description: >
+  验证 Agent 能否利用 errno=28、AOF/RDB 状态和 Redis 日志确认磁盘已满，
+  并解释持久化失败、写入拒绝等连锁影响。
+
+# 场景来源与复核信息。
+provenance:
+  # 人工构造案例。
+  kind: synthetic
+  # 本地 fixture 证据。
+  source: local_fixture
+  # 维护者角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 运行定义。
+execution:
+  # 直接运行 Agent。
+  lane: agent_only
+  # Redis SRE Agent。
+  agent: redis_sre
+  # 用户问题。
+  query: >
+    Redis 同时出现写入失败、AOF 报错和 RDB 保存失败。请确认是否为磁盘满，
+    说明各类失败之间的关系，并给出安全恢复步骤。
+  # 工具预算。
+  max_tool_steps: 5
+  # 固定离线 replay。
+  llm_mode: replay
+  # 工具调用和参考答案。
+  replay:
+    # 三组诊断证据。
+    tool_calls:
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取持久化状态。
+        operation: info
+        # INFO 参数。
+        args:
+          # persistence section。
+          section: persistence
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 检查保存失败时是否拒绝写入。
+        operation: config_get
+        # CONFIG GET 参数。
+        args:
+          # 目标配置项。
+          pattern: stop-writes-on-bgsave-error
+      # Loki 日志 provider。
+      - provider: loki
+        # 查询故障时间窗日志。
+        operation: query_range
+        # LogQL 和时间参数。
+        args:
+          # 筛选 Redis 的磁盘与持久化错误。
+          query: '{job="redis"} |~ "No space left|MISCONF|AOF|RDB"'
+          # 最近 30 分钟。
+          start: 30m
+          # 当前结束。
+          end: now
+          # 最多返回 100 条。
+          limit: 100
+          # 最新日志优先。
+          direction: backward
+    # Judge 参考答案。
+    reference_answer: |
+      磁盘满是当前故障链的直接原因。INFO persistence 同时显示
+      rdb_last_bgsave_status=err、aof_last_write_status=err、aof_last_write_errno=28；
+      errno 28 对应 ENOSPC。Loki 日志明确记录 No space left on device，随后出现
+      RDB 保存失败和 MISCONF 写入拒绝；CONFIG 中 stop-writes-on-bgsave-error=yes
+      解释了为什么写命令被保护性拒绝。应先停止非必要写入并确认挂载点，安全释放或扩容空间，
+      保护现有 AOF/RDB 文件，恢复后重新验证 AOF 写入和 BGSAVE。不要把关闭保护配置当作修复，
+      否则会在持久化不可用时继续接受有丢失风险的写入。
+
+# 离线目标范围。
+scope:
+  # fixture-only 模式。
+  mode: offline
+  # 唯一 Redis 实例。
+  redis_instance:
+    # 实例 ID。
+    id: eval-disk-full-failures
+    # 实例名称。
+    name: offline-disk-full-failures
+    # 占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 测试环境。
+    environment: test
+    # 诊断用途。
+    usage: diagnostics
+    # 实例说明。
+    description: 磁盘满导致持久化与写入失败的离线评测目标
+    # 未知状态。
+    status: unknown
+    # 由 Agent 创建。
+    created_by: agent
+
+# provider fixture 映射。
+tools:
+  # Redis 命令 fixture。
+  redis_command:
+    # INFO persistence 响应。
+    info:
+      # fixture 路径。
+      result: fixtures/tools/info-persistence.json
+    # CONFIG GET 响应。
+    config_get:
+      # fixture 路径。
+      result: fixtures/tools/config-stop-writes.json
+  # Loki fixture。
+  loki:
+    # 范围日志响应。
+    query_range:
+      # fixture 路径。
+      result: fixtures/tools/loki-disk-errors.json
+
+# 语义期望。
+expectations:
+  # 启用语义 Judge。
+  judge: semantic
+  # 必须覆盖的发现。
+  required_findings:
+    - 指出 aof_last_write_errno 为 28，日志明确记录 No space left on device
+    - 说明磁盘满同时导致 AOF 写失败和 RDB BGSAVE 失败
+    - 将 stop-writes-on-bgsave-error=yes 与 MISCONF 写入拒绝关联起来
+    - 建议安全释放或扩容空间、保护持久化文件并在恢复后验证 AOF 和 BGSAVE
+  # 禁止的错误结论。
+  forbidden_claims:
+    - 建议把 stop-writes-on-bgsave-error 关闭作为主要修复
+    - 声称只是客户端命令错误，与磁盘无关
+    - 建议未经确认直接删除 AOF 或 RDB 文件
+
+# 不注入 knowledge 或 memory。

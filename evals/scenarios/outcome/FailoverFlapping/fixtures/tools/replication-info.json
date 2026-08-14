@@ -1,0 +1,19 @@
+{
+  "status": "success",
+  "info": {
+    "role": "master",
+    "connected_slaves": 1,
+    "master_failover_state": "no-failover",
+    "master_replid": "c4f1f840b6f10f2d0ccbbcf87d80a8bbf7e3c018",
+    "master_replid2": "96ec3ca1c0bd6e8edfc93a509d3900a5431dca10",
+    "master_repl_offset": 984411002,
+    "second_repl_offset": 972804118,
+    "repl_backlog_active": 1,
+    "slave0": "ip=10.40.0.12,port=6379,state=online,offset=984410881,lag=0"
+  },
+  "role": {
+    "type": "master",
+    "offset": 984411002,
+    "details": [["10.40.0.12", 6379, 984410881]]
+  }
+}

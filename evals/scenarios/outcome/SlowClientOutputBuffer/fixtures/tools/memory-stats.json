@@ -1,0 +1,20 @@
+{
+  "status": "success",
+  "stats": {
+    "peak.allocated": 4475359232,
+    "total.allocated": 4362076160,
+    "dataset.bytes": 2254857830,
+    "dataset.percentage": 51.69,
+    "clients.normal": 1997159792,
+    "clients.slaves": 12582912,
+    "overhead.total": 2107218330
+  },
+  "interpretation_notes": [
+    "MEMORY STATS client fields are bytes, not connection counts.",
+    "Use CLIENT LIST to identify the specific large output buffer."
+  ],
+  "canonical_sources": {
+    "memory_breakdown": ["MEMORY STATS", "INFO memory"],
+    "client_counts": ["INFO clients", "CLIENT LIST"]
+  }
+}

@@ -36,6 +36,7 @@ _EXPECTED_REDIS_OPERATIONS = {
     "cluster_info",
     "replication_info",
     "memory_stats",
+    "bigkey_scan",
     "sample_keys",
     "search_indexes",
     "search_index_info",
@@ -182,10 +183,10 @@ async def test_manager_registers_21_observability_tools_without_connecting(
     assert redis_operations == _EXPECTED_REDIS_OPERATIONS
     assert prometheus_operations == _EXPECTED_PROMETHEUS_OPERATIONS
     assert loki_operations == _EXPECTED_LOKI_OPERATIONS
-    assert len(redis_definitions) == 11
+    assert len(redis_definitions) == 12
     assert len(prometheus_definitions) == 3
     assert len(loki_definitions) == 7
-    assert len(redis_definitions + prometheus_definitions + loki_definitions) == 21
+    assert len(redis_definitions + prometheus_definitions + loki_definitions) == 22
     assert all(
         tool.name.startswith(f"redis_command_{instance_hash}_")
         for tool in redis_definitions

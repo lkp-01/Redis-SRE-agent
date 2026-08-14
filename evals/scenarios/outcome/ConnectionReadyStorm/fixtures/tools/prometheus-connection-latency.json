@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "query": "redis_connected_clients or redis_rejected_connections_total or redis_commands_duration_seconds",
+  "start_time": "30m",
+  "end_time": "now",
+  "step": "30s",
+  "data": [
+    {"metric": {"__name__": "redis_connected_clients", "instance": "offline-connection-ready-storm"}, "values": [[1723600000, "2012"], [1723600900, "7440"], [1723601800, "18240"]]},
+    {"metric": {"__name__": "redis_rejected_connections_total", "instance": "offline-connection-ready-storm"}, "values": [[1723600000, "0"], [1723600900, "0"], [1723601800, "0"]]},
+    {"metric": {"__name__": "redis_commands_duration_seconds", "quantile": "0.99"}, "values": [[1723600000, "0.0018"], [1723600900, "0.011"], [1723601800, "0.042"]]}
+  ],
+  "timestamp": "2026-08-14T08:00:00Z"
+}

@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "query": "node_disk_io_time_weighted_seconds_total or node_disk_io_time_seconds_total or redis_commands_duration_seconds",
+  "start_time": "30m",
+  "end_time": "now",
+  "step": "30s",
+  "data": [
+    {"metric": {"__name__": "node_disk_io_time_seconds_total", "device": "nvme1n1", "stat": "utilization"}, "values": [[1723600000, "0.42"], [1723600900, "0.91"], [1723601800, "0.998"]]},
+    {"metric": {"__name__": "node_disk_io_time_weighted_seconds_total", "device": "nvme1n1", "stat": "p99_await"}, "values": [[1723600000, "0.009"], [1723600900, "0.084"], [1723601800, "0.186"]]},
+    {"metric": {"__name__": "redis_commands_duration_seconds", "quantile": "0.99"}, "values": [[1723600000, "0.003"], [1723600900, "0.098"], [1723601800, "0.210"]]}
+  ],
+  "timestamp": "2026-08-14T08:00:00Z"
+}

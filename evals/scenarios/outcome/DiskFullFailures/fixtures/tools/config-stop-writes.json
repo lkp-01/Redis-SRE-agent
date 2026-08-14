@@ -1,0 +1,8 @@
+{
+  "status": "success",
+  "pattern": "stop-writes-on-bgsave-error",
+  "count": 1,
+  "config": {
+    "stop-writes-on-bgsave-error": "yes"
+  }
+}

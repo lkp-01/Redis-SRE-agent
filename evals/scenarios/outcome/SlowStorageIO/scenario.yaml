@@ -1,0 +1,146 @@
+# 场景唯一 ID。
+id: outcome/slow-storage-io
+# 人类可读名称。
+name: Diagnose Redis latency caused by slow shared storage I/O
+# Judge 使用的场景说明。
+description: >
+  验证 Agent 能否把块设备高 await/高利用率、长时间 RDB 后台保存和系统日志关联起来，
+  并区别于 AOF fsync 特有故障或磁盘空间耗尽。
+
+# 来源与维护信息。
+provenance:
+  # 人工构造案例。
+  kind: synthetic
+  # 本地 fixture 证据。
+  source: local_fixture
+  # 维护者角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 运行定义。
+execution:
+  # 直接运行 Agent。
+  lane: agent_only
+  # Redis SRE Agent。
+  agent: redis_sre
+  # 用户问题。
+  query: >
+    Redis 在做 RDB 后台保存时延迟升高，磁盘没有满但 I/O 很慢。
+    请定位原因、给出存储证据并说明如何降低影响。
+  # 工具预算。
+  max_tool_steps: 5
+  # 固定离线 replay。
+  llm_mode: replay
+  # 工具调用和参考答案。
+  replay:
+    # 三组诊断证据。
+    tool_calls:
+      # Prometheus provider。
+      - provider: prometheus
+        # 查询块设备和 Redis 延迟趋势。
+        operation: query_range
+        # PromQL 与范围参数。
+        args:
+          # 观察 await、利用率和命令延迟。
+          query: 'node_disk_io_time_weighted_seconds_total or node_disk_io_time_seconds_total or redis_commands_duration_seconds'
+          # 最近 30 分钟。
+          start_time: 30m
+          # 当前结束。
+          end_time: now
+          # 30 秒采样。
+          step: 30s
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取 RDB 后台保存状态。
+        operation: info
+        # INFO 参数。
+        args:
+          # persistence section。
+          section: persistence
+      # Loki provider。
+      - provider: loki
+        # 查询存储慢和 RDB 日志。
+        operation: query_range
+        # LogQL 与时间范围。
+        args:
+          # 筛选块设备延迟和后台保存日志。
+          query: '{job=~"node|redis"} |~ "I/O latency|Background saving"'
+          # 最近 30 分钟。
+          start: 30m
+          # 当前结束。
+          end: now
+          # 最多 100 条。
+          limit: 100
+          # 最新优先。
+          direction: backward
+    # Judge 对照答案。
+    reference_answer: |
+      当前证据支持共享块设备 I/O 饱和拖慢 RDB 后台保存，并与 Redis 延迟同时上升。
+      Prometheus 显示设备 nvme1n1 利用率接近 100%、p99 await 约 186 ms，Redis p99
+      延迟升至约 210 ms；INFO persistence 显示 RDB BGSAVE 已运行 612 秒且 AOF 未启用，
+      因此不是 AOF fsync 特有问题。Loki 同时记录块设备 I/O latency 和后台保存耗时过长，
+      但没有 ENOSPC。应排查同盘 workload 和云盘限额，隔离/扩容存储 IOPS，错峰快照，
+      并评估复制或备份策略；不能把磁盘满或 AOF 损坏当作已证实原因。
+
+# 离线目标范围。
+scope:
+  # fixture-only 模式。
+  mode: offline
+  # 唯一 Redis 目标。
+  redis_instance:
+    # 实例 ID。
+    id: eval-slow-storage-io
+    # 实例名称。
+    name: offline-slow-storage-io
+    # 占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 测试环境。
+    environment: test
+    # 诊断用途。
+    usage: diagnostics
+    # 实例说明。
+    description: 共享存储 I/O 变慢的离线评测目标
+    # 未知状态。
+    status: unknown
+    # 由 Agent 创建。
+    created_by: agent
+
+# provider fixture 映射。
+tools:
+  # Prometheus fixture。
+  prometheus:
+    # 块设备范围查询响应。
+    query_range:
+      # fixture 路径。
+      result: fixtures/tools/prometheus-storage-io.json
+  # Redis 命令 fixture。
+  redis_command:
+    # INFO persistence 响应。
+    info:
+      # fixture 路径。
+      result: fixtures/tools/info-persistence.json
+  # Loki fixture。
+  loki:
+    # 存储日志响应。
+    query_range:
+      # fixture 路径。
+      result: fixtures/tools/loki-storage-io.json
+
+# 语义期望。
+expectations:
+  # 使用语义 Judge。
+  judge: semantic
+  # 必须覆盖的发现。
+  required_findings:
+    - 指出 nvme1n1 利用率接近 100% 且 p99 await 约 186 ms
+    - 将 RDB BGSAVE 已持续 612 秒与存储 I/O 饱和和 Redis 延迟关联起来
+    - 指出 AOF 未启用且没有 ENOSPC，不能判为 AOF 特有故障或磁盘满
+    - 建议隔离同盘 workload、扩容 IOPS 并错峰快照
+  # 禁止的错误结论。
+  forbidden_claims:
+    - 声称磁盘空间已经耗尽
+    - 声称 AOF fsync 是当前主因
+    - 忽略同盘 workload 和存储限额只建议重启 Redis
+
+# 不注入 knowledge 或 memory。

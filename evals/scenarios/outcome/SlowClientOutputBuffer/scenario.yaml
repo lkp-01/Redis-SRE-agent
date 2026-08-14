@@ -1,0 +1,126 @@
+# 场景唯一 ID。
+id: outcome/slow-client-output-buffer
+# 人类可读名称。
+name: Diagnose memory growth from a slow client receiver
+# Judge 使用的能力说明。
+description: >
+  验证 Agent 能否识别下游客户端接收过慢导致 Redis client output buffer 膨胀，
+  并避免把这类内存增长误判为 keyspace 数据增长。
+
+# 场景来源与维护信息。
+provenance:
+  # 人工合成场景。
+  kind: synthetic
+  # 使用本地 fixture。
+  source: local_fixture
+  # 维护者角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 运行和 replay 定义。
+execution:
+  # 直接运行 Agent。
+  lane: agent_only
+  # Redis SRE Agent。
+  agent: redis_sre
+  # 用户问题。
+  query: >
+    Redis 内存持续上涨，但业务写入量没有明显变化。请判断是否有客户端接收太慢，
+    给出具体客户端证据、内存归属和处置建议。
+  # 工具预算。
+  max_tool_steps: 5
+  # 固定离线 replay。
+  llm_mode: replay
+  # 三次工具调用和参考答案。
+  replay:
+    # 必须依次执行的调用。
+    tool_calls:
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取连接汇总。
+        operation: info
+        # INFO 参数。
+        args:
+          # clients section。
+          section: clients
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取内存分类。
+        operation: memory_stats
+        # MEMORY STATS 无参数。
+        args: {}
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取普通客户端明细。
+        operation: client_list
+        # 只检查 normal 客户端。
+        args:
+          # CLIENT LIST TYPE normal。
+          client_type: normal
+    # Judge 对照答案。
+    reference_answer: |
+      内存上涨主要来自慢接收客户端的 output buffer。MEMORY STATS 显示 clients.normal
+      占用约 1.86 GiB，而 dataset.bytes 约 2.1 GiB且稳定；CLIENT LIST 中
+      report-exporter-7 的 omem=1711276032、oll=26118、events=w、idle=0，远高于其他客户端，
+      INFO clients 的 client_recent_max_output_buffer 也达到约 1.59 GiB。应先确认该消费者
+      是否卡住，限速或暂停生产端，必要时终止该连接，并修复客户端读取能力；同时配置合理的
+      client-output-buffer-limit 和告警。不能仅通过淘汰 key 处理，因为证据指向客户端缓冲区。
+
+# 离线目标范围。
+scope:
+  # 禁止真实连接。
+  mode: offline
+  # 唯一 Redis 实例。
+  redis_instance:
+    # 实例 ID。
+    id: eval-slow-client-output-buffer
+    # 实例名称。
+    name: offline-slow-client-output-buffer
+    # 占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 测试环境。
+    environment: test
+    # 诊断用途。
+    usage: diagnostics
+    # 实例说明。
+    description: 慢客户端输出缓冲区膨胀的离线评测目标
+    # 未知状态。
+    status: unknown
+    # 由评测 Agent 创建。
+    created_by: agent
+
+# provider fixture 映射。
+tools:
+  # Redis 命令 fixture。
+  redis_command:
+    # INFO clients 响应。
+    info:
+      # fixture 路径。
+      result: fixtures/tools/info-clients.json
+    # MEMORY STATS 响应。
+    memory_stats:
+      # fixture 路径。
+      result: fixtures/tools/memory-stats.json
+    # CLIENT LIST 响应。
+    client_list:
+      # fixture 路径。
+      result: fixtures/tools/client-list-normal.json
+
+# 语义期望。
+expectations:
+  # 使用语义 Judge。
+  judge: semantic
+  # 必须覆盖的发现。
+  required_findings:
+    - 指出 clients.normal 约占用 1.86 GiB，且 client_recent_max_output_buffer 约为 1.59 GiB
+    - 定位 report-exporter-7 的 omem 为 1711276032、oll 为 26118 且 events=w
+    - 将内存上涨归因于慢接收客户端的 output buffer，而不是缺少证据的 keyspace 暴涨
+    - 建议修复或隔离慢消费者，并设置 client-output-buffer-limit 和相关告警
+  # 禁止的错误结论。
+  forbidden_claims:
+    - 把 clients.normal 字节数解释为客户端连接数量
+    - 断言 keyspace 数据增长是当前内存上涨的主因
+    - 在未识别具体慢客户端时只建议扩大 Redis 内存
+
+# 不注入 knowledge 或 memory。

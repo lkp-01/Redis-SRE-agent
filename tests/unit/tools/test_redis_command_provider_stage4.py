@@ -32,6 +32,7 @@ _EXPECTED_OPERATIONS = {
     "cluster_info",
     "replication_info",
     "memory_stats",
+    "bigkey_scan",
     "sample_keys",
     "search_indexes",
     "search_index_info",
@@ -62,18 +63,26 @@ class FakePipeline:
     def type(self, key: str) -> None:
         self.commands.append(("type", key))
 
+    def memory_usage(self, key: str, samples: int = 5) -> None:
+        self.commands.append(("memory_usage", (key, samples)))
+
     async def execute(self) -> list[Any]:
-        if not self.commands:
-            return []
-        operation = self.commands[0][0]
-        if operation == "randomkey":
-            return [
-                self.client.random_keys[index % len(self.client.random_keys)]
-                for index, _ in enumerate(self.commands)
-            ]
-        if operation == "type":
-            return [self.client.key_types.get(str(key), "string") for _, key in self.commands]
-        return []
+        results: list[Any] = []
+        random_index = 0
+        for operation, argument in self.commands:
+            if operation == "randomkey":
+                results.append(
+                    self.client.random_keys[random_index % len(self.client.random_keys)]
+                )
+                random_index += 1
+            elif operation == "type":
+                results.append(self.client.key_types.get(str(argument), "string"))
+            elif operation == "memory_usage":
+                if self.client.memory_usage_error is not None:
+                    raise self.client.memory_usage_error
+                key, _samples = argument
+                results.append(self.client.memory_sizes.get(str(key)))
+        return results
 
 
 class FakeRedisClient:
@@ -82,9 +91,11 @@ class FakeRedisClient:
         *,
         info_error: Exception | None = None,
         memory_stats_error: Exception | None = None,
+        memory_usage_error: Exception | None = None,
     ) -> None:
         self.info_error = info_error
         self.memory_stats_error = memory_stats_error
+        self.memory_usage_error = memory_usage_error
         self.closed = False
         self.random_keys = ["session:1", "cart:1", "session:1", "stream:1", None]
         self.key_types = {
@@ -92,6 +103,21 @@ class FakeRedisClient:
             "cart:1": "hash",
             "stream:1": "stream",
         }
+        self.memory_sizes = {
+            "session:1": 512,
+            "cart:1": 2_500_000,
+            "stream:1": 1_500_000,
+        }
+        self.scan_calls = 0
+
+    async def scan(
+        self,
+        cursor: int = 0,
+        *,
+        count: int | None = None,
+    ) -> tuple[int, list[str]]:
+        self.scan_calls += 1
+        return 0, ["session:1", "cart:1", "stream:1"]
 
     async def info(self, section: str | None = None) -> dict[str, Any]:
         if self.info_error is not None:
@@ -254,6 +280,13 @@ async def test_stage4_tools_return_structured_evidence() -> None:
     cluster = await provider.cluster_info()
     replication = await provider.replication_info()
     memory = await provider.memory_stats()
+    bigkeys = await provider.bigkey_scan(
+        threshold_bytes=1_000_000,
+        max_keys=10,
+        scan_count=10,
+        top_n=2,
+        time_limit_ms=1_000,
+    )
     sample = await provider.sample_keys(count=3)
     indexes = await provider.search_indexes()
     index_info = await provider.search_index_info("idx:users")
@@ -277,6 +310,17 @@ async def test_stage4_tools_return_structured_evidence() -> None:
     assert memory["stats"]["peak.allocated"] == 2048
     assert memory["interpretation_notes"]
     assert memory["canonical_sources"]["client_counts"] == ["INFO clients", "CLIENT LIST"]
+    assert bigkeys["status"] == "success"
+    assert bigkeys["scan_complete"] is True
+    assert bigkeys["stop_reason"] == "cursor_exhausted"
+    assert bigkeys["keys_scanned"] == 3
+    assert bigkeys["keys_measured"] == 3
+    assert bigkeys["big_key_count"] == 2
+    assert [item["key"] for item in bigkeys["largest_keys"]] == [
+        "cart:1",
+        "stream:1",
+    ]
+    assert all(item["is_big"] for item in bigkeys["big_keys"])
     assert sample["sampled_count"] == 3
     assert sample["keys"]
     assert sample["type_distribution"] == {"string": 1, "hash": 1, "stream": 1}
@@ -290,11 +334,55 @@ async def test_stage4_tools_return_structured_evidence() -> None:
             "config": config,
             "clients": clients,
             "memory": memory,
+            "bigkeys": bigkeys,
             "sample": sample,
             "indexes": indexes,
             "index_info": index_info,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_bigkey_scan_stops_at_key_budget_without_claiming_full_scan() -> None:
+    client = FakeRedisClient()
+
+    async def paged_scan(
+        cursor: int = 0,
+        *,
+        count: int | None = None,
+    ) -> tuple[int, list[str]]:
+        client.scan_calls += 1
+        return 7, ["session:1", "cart:1", "stream:1"]
+
+    client.scan = paged_scan  # type: ignore[method-assign]
+    provider = make_provider(client)
+
+    result = await provider.bigkey_scan(
+        threshold_bytes=1_000_000,
+        max_keys=2,
+        scan_count=100,
+        top_n=10,
+        time_limit_ms=1_000,
+    )
+
+    assert result["status"] == "success"
+    assert result["scan_complete"] is False
+    assert result["stop_reason"] == "max_keys_reached"
+    assert result["keys_scanned"] == 2
+    assert result["keys_measured"] == 2
+    assert client.scan_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bigkey_scan_marks_memory_usage_as_unsupported() -> None:
+    provider = make_provider(
+        FakeRedisClient(memory_usage_error=RuntimeError("unknown command 'MEMORY'"))
+    )
+
+    result = await provider.bigkey_scan()
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "unsupported_command"
 
 
 @pytest.mark.asyncio

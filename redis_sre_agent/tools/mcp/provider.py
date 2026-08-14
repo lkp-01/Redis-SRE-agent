@@ -220,6 +220,7 @@ class MCPToolProvider(ToolProvider):
     async def _connect(self) -> None:
         if self._session is not None:
             return
+
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
         try:

@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "query": "rate(process_cpu_seconds_total[1m]) or rate(container_cpu_cfs_throttled_seconds_total[1m]) or node_load1",
+  "start_time": "30m",
+  "end_time": "now",
+  "step": "30s",
+  "data": [
+    {"metric": {"__name__": "process_cpu_seconds_total", "process": "redis-server", "rate": "1m"}, "values": [[1723600000, "0.61"], [1723600900, "0.94"], [1723601800, "0.99"]]},
+    {"metric": {"__name__": "container_cpu_cfs_throttled_seconds_total", "container": "redis", "rate": "1m"}, "values": [[1723600000, "0.01"], [1723600900, "0.21"], [1723601800, "0.38"]]},
+    {"metric": {"__name__": "node_load1", "instance": "redis-host-8"}, "values": [[1723600000, "3.2"], [1723600900, "9.8"], [1723601800, "14.6"]]}
+  ],
+  "timestamp": "2026-08-14T08:00:00Z"
+}

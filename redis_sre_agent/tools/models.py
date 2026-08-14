@@ -87,6 +87,7 @@ _READ_EXACT = {
     "ping",
     "rebalance_status",
     "slowlog",
+    "bigkey_scan",
 }
 _READ_DESCRIPTION_MARKERS = (
     "get ",
@@ -235,6 +236,5 @@ class SystemHost(BaseModel):
     port: Optional[int] = None
     role: Optional[str] = None
     labels: Dict[str, str] = Field(default_factory=dict)
-
 
 

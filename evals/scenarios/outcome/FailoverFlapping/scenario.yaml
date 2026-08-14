@@ -1,0 +1,145 @@
+# 场景唯一 ID。
+id: outcome/failover-flapping
+# 人类可读名称。
+name: Diagnose instability from frequent Redis primary-replica failovers
+# Judge 使用的场景说明。
+description: >
+  验证 Agent 能否通过角色变化指标、复制状态和 Sentinel 日志识别主从切换抖动，
+  并给出稳定拓扑而非继续手工切换的处置建议。
+
+# 来源与维护信息。
+provenance:
+  # 人工构造案例。
+  kind: synthetic
+  # 本地 fixture 证据。
+  source: local_fixture
+  # 维护者角色。
+  owner: redis-sre-eval
+  # 最近复核日期。
+  reviewed_at: "2026-08-14"
+
+# 运行定义。
+execution:
+  # 直接运行 Agent。
+  lane: agent_only
+  # Redis SRE Agent。
+  agent: redis_sre
+  # 用户问题。
+  query: >
+    Redis 集群在主节点和从节点之间频繁切换，应用不断重连。
+    请确认是否发生 failover flapping、说明影响，并给出稳定方案。
+  # 工具预算。
+  max_tool_steps: 5
+  # 固定离线 replay。
+  llm_mode: replay
+  # 三次工具调用和参考答案。
+  replay:
+    # 必须执行的调用。
+    tool_calls:
+      # Redis 命令 provider。
+      - provider: redis_command
+        # 获取当前复制角色与 offset。
+        operation: replication_info
+        # 该 operation 无参数。
+        args: {}
+      # Prometheus provider。
+      - provider: prometheus
+        # 查询角色变化和可用性趋势。
+        operation: query_range
+        # PromQL 与时间范围。
+        args:
+          # 观察角色切换次数和 up 指标。
+          query: 'changes(redis_instance_role[30m]) or redis_up or redis_connected_slaves'
+          # 最近 30 分钟。
+          start_time: 30m
+          # 当前结束。
+          end_time: now
+          # 30 秒采样。
+          step: 30s
+      # Loki provider。
+      - provider: loki
+        # 查询 Sentinel 切换日志。
+        operation: query_range
+        # LogQL 与时间范围。
+        args:
+          # 筛选主观下线、客观下线和 switch-master。
+          query: '{job="redis-sentinel"} |~ "sdown|odown|switch-master"'
+          # 最近 30 分钟。
+          start: 30m
+          # 当前结束。
+          end: now
+          # 最多 200 条。
+          limit: 200
+          # 最新优先。
+          direction: backward
+    # Judge 对照答案。
+    reference_answer: |
+      证据确认发生 failover flapping。Prometheus 在 30 分钟内记录 7 次角色变化，
+      redis_up 在每次切换附近短暂降为 0；Sentinel 日志反复出现 +sdown、+odown、
+      +switch-master，并在 10.40.0.11 与 10.40.0.12 之间往返。当前节点虽再次为 master，
+      replication_info 的 second_repl_offset 和 replid2 也说明近期发生过复制纪元切换。
+      应先阻止继续扩大影响，检查 Sentinel 间网络、quorum/down-after-milliseconds、
+      主从负载与时钟，再恢复稳定自动故障转移；不要继续手工来回 promote，也不要简单关闭
+      高可用而不处理误判来源。
+
+# 离线目标范围。
+scope:
+  # fixture-only 模式。
+  mode: offline
+  # 唯一 Redis 目标。
+  redis_instance:
+    # 实例 ID。
+    id: eval-failover-flapping
+    # 实例名称。
+    name: offline-failover-flapping
+    # 占位 URL。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 测试环境。
+    environment: test
+    # 诊断用途。
+    usage: diagnostics
+    # 实例说明。
+    description: 主从频繁切换的离线评测目标
+    # 未知状态。
+    status: unknown
+    # 由 Agent 创建。
+    created_by: agent
+
+# provider fixture 映射。
+tools:
+  # Redis 命令 fixture。
+  redis_command:
+    # replication_info 响应。
+    replication_info:
+      # fixture 路径。
+      result: fixtures/tools/replication-info.json
+  # Prometheus fixture。
+  prometheus:
+    # 角色范围查询响应。
+    query_range:
+      # fixture 路径。
+      result: fixtures/tools/prometheus-role-changes.json
+  # Loki fixture。
+  loki:
+    # Sentinel 日志响应。
+    query_range:
+      # fixture 路径。
+      result: fixtures/tools/loki-sentinel-failovers.json
+
+# 语义期望。
+expectations:
+  # 使用语义 Judge。
+  judge: semantic
+  # 必须覆盖的发现。
+  required_findings:
+    - 指出 30 分钟内发生 7 次角色变化，且 redis_up 在切换窗口短暂下降
+    - 指出 Sentinel 日志在 10.40.0.11 与 10.40.0.12 之间反复 switch-master
+    - 将重复切换与应用重连和可用性抖动关联起来
+    - 建议检查 Sentinel 网络、quorum、down-after-milliseconds 和节点负载后恢复稳定拓扑
+  # 禁止的错误结论。
+  forbidden_claims:
+    - 声称只发生了一次正常计划内切换
+    - 建议继续手工来回提升主节点
+    - 在未排查误判来源时永久关闭高可用
+
+# 不注入 knowledge 或 memory。

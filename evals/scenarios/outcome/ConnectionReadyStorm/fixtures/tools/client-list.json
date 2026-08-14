@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "client_type": "all",
+  "count": 18240,
+  "sample_note": "Representative sample: 91% of connections had events=r and idle=0 at capture time.",
+  "clients": [
+    {"id": "1001", "addr": "10.20.1.10:41001", "name": "api-1", "flags": "N", "events": "r", "idle": "0", "cmd": "get", "qbuf": "16384", "omem": "0"},
+    {"id": "1002", "addr": "10.20.1.11:41002", "name": "api-2", "flags": "N", "events": "r", "idle": "0", "cmd": "get", "qbuf": "8192", "omem": "0"},
+    {"id": "1003", "addr": "10.20.1.12:41003", "name": "api-3", "flags": "N", "events": "r", "idle": "0", "cmd": "set", "qbuf": "12288", "omem": "0"},
+    {"id": "1004", "addr": "10.20.1.13:41004", "name": "api-4", "flags": "N", "events": "rw", "idle": "0", "cmd": "get", "qbuf": "4096", "omem": "0"}
+  ]
+}

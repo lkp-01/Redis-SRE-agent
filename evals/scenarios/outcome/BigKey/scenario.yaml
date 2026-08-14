@@ -1,0 +1,161 @@
+# 场景的全局唯一标识；用于评测结果、CLI 输出和隔离运行 session。
+id: outcome/bigkey-latency
+
+# 面向维护者和评测报告的人类可读名称。
+name: Diagnose latency caused by a BigKey
+
+# 概括这个场景想验证的 Agent 能力；同时作为 Judge 的背景说明。
+description: >
+  验证 Agent 能否将超大 Redis list 的反复全量读取与延迟升高关联起来，
+  排除当前证据不支持的内存压力结论，并提出针对性的处置建议。
+
+# 记录场景、fixture 和参考答案的来源，便于判断评测基准的可信度与维护责任。
+provenance:
+  # 场景数据的性质；synthetic 表示这是人工构造的可重复测试案例。
+  kind: synthetic
+  # 场景证据的直接来源；这里来自同目录下的本地 JSON fixture。
+  source: local_fixture
+  # 负责维护和复核此评测场景的团队或角色。
+  owner: redis-sre-eval
+  # 最近一次人工复核场景证据与参考答案的日期。
+  reviewed_at: "2026-08-14"
+
+# 定义本题如何选择 Agent、向它提问以及怎样重放工具调用。
+execution:
+  # 运行通道；agent_only 表示直接运行被测 Agent，不经过额外路由评测。
+  lane: agent_only
+  # 实际要创建的 Agent 类型；运行时会读取并校验该字段。
+  agent: redis_sre
+  # 发送给被测 Agent 的原始用户问题。
+  query: >
+    当前 Redis 实例延迟明显升高，请定位主要原因，给出判断依据，
+    排除当前证据不支持的原因，并提供处置建议。
+  # 工具循环预算；运行时会额外预留一次迭代用于根据证据生成最终回答。
+  max_tool_steps: 5
+  # LLM 工具调用模式；replay 表示严格按下面的固定 transcript 离线重放。
+  llm_mode: replay
+
+  # 描述确定性的工具调用 transcript，以及只供 Judge 参考的标准答案。
+  replay:
+    # 被测 Agent 在本场景中必须依次完成的工具调用。
+    tool_calls:
+      # provider 指定工具家族；redis_command 表示 Redis 原生命令诊断工具。
+      - provider: redis_command
+        # Redis operation 名称；info 用于获取指定 INFO section。
+        operation: info
+        # 传给 info operation 的参数。
+        args:
+          # 只查询 Redis memory section，获取容量、碎片率和 eviction 证据。
+          section: memory
+
+      # provider 指定工具家族；本调用继续使用 Redis 原生命令诊断工具。
+      - provider: redis_command
+        # Redis operation 名称；slowlog 用于检查近期慢命令。
+        operation: slowlog
+        # 传给 slowlog operation 的参数。
+        args:
+          # 最多请求最近 5 条慢日志记录。
+          count: 5
+
+      # provider 指定工具家族；本调用继续使用 Redis 原生命令诊断工具。
+      - provider: redis_command
+        # Redis operation 名称；bigkey_scan 用于识别高内存占用 key。
+        operation: bigkey_scan
+        # 控制 BigKey 扫描阈值、工作量和时限的参数。
+        args:
+          # 超过 1 MiB 的 key 才被标记为 BigKey。
+          threshold_bytes: 1048576
+          # 单次评测最多扫描的 key 数，避免无界运行。
+          max_keys: 20000
+          # 每轮 SCAN 使用的 COUNT 提示值。
+          scan_count: 500
+          # 最多保留内存占用最大的 20 个 key。
+          top_n: 20
+          # 扫描的最长允许时间，单位为毫秒。
+          time_limit_ms: 5000
+
+    # 供 Judge 对照事实与完整性；不会直接作为被测 Agent 的输出。
+    reference_answer: |
+      当前最有证据支持的主因，是对超大 list
+      `user:timeline:10086` 的反复全量读取。
+
+      bigkey_scan 显示该 key 占用 824633720 bytes。
+      SLOWLOG 连续记录了 `LRANGE user:timeline:10086 0 -1`，
+      单次耗时约 166–186 ms。
+
+      当前内存使用约为 3.2G/8.0G，且没有 eviction，
+      因此现有证据不支持内存耗尽或 eviction 压力是主要原因。
+
+      建议拆分该 key，并改用限制范围或分页读取。
+
+# 限定 Agent 当前可见和可操作的 Redis 目标；运行时据此构造离线实例。
+scope:
+  # offline 表示所有 Redis 调用必须由 fixture 响应，禁止连接真实 Redis。
+  mode: offline
+  # 本场景唯一绑定的 Redis 实例信息。
+  redis_instance:
+    # Redis 实例唯一 ID；也用于生成工具身份与运行上下文。
+    id: eval-bigkey
+    # 报告、提示词和工具上下文中显示的实例名称。
+    name: offline-bigkey
+    # 占位连接地址；offline runtime 会拦截调用，不会真正建立连接。
+    connection_url: redis://evaluation.invalid:6379/0
+    # 实例所属环境，用于还原 Agent 实际可见的目标上下文。
+    environment: test
+    # 实例用途；这里模拟作为 cache 使用的 Redis。
+    usage: cache
+    # 向运行时和维护者说明该目标只是离线评测占位实例。
+    description: 仅供 BigKey 离线评测使用的占位目标
+    # 实例当前状态；unknown 避免凭空给 Agent 注入健康结论。
+    status: unknown
+    # 满足 RedisInstance 的来源约束，表明该占位实例由评测 Agent 创建。
+    created_by: agent
+
+# 声明允许调用的工具及每种调用应返回的本地 fixture。
+tools:
+  # 工具 provider family；本场景只允许 Redis command 诊断工具。
+  redis_command:
+    # info operation 的离线响应规则。
+    info:
+      # 根据调用参数选择不同结果文件的条件响应列表。
+      responders:
+        # 单条 responder：when 匹配成功后使用对应 result。
+        - when:
+            # 要求实际调用参数至少包含下面这些键值。
+            args_contains:
+              # 仅为 INFO memory 调用匹配这份 fixture。
+              section: memory
+          # 参数匹配后读取的 JSON fixture 相对路径。
+          result: fixtures/tools/info-memory.json
+
+    # slowlog operation 的离线响应规则。
+    slowlog:
+      # 无条件返回的 SLOWLOG JSON fixture 相对路径。
+      result: fixtures/tools/slowlog.json
+
+    # bigkey_scan operation 的离线响应规则。
+    bigkey_scan:
+      # 无条件返回的 BigKey 扫描 JSON fixture 相对路径。
+      result: fixtures/tools/bigkey-scan.json
+
+# 定义怎样判断 Agent 的工具使用和最终诊断是否合格。
+expectations:
+  # semantic 表示结论质量交给 LLM Judge 做语义判断，工具轨迹仍做机械校验。
+  judge: semantic
+
+  # 最终回答必须在语义上覆盖的事实、推理和处置建议。
+  required_findings:
+    - 识别出 `user:timeline:10086` 是一个占用 824633720 bytes 的超大 list
+    - 指出 SLOWLOG 多次记录了对 `user:timeline:10086` 执行 `LRANGE 0 -1`
+    - 将该超大 list 的反复全量读取与当前延迟升高关联起来，并将其判断为当前最有证据支持的主要原因
+    - 指出当前证据不支持内存耗尽或 eviction 压力是延迟升高的主要原因
+    - 建议拆分该 key，或者限制、分页读取，避免继续执行全量读取
+
+  # 最终回答一旦包含这些错误结论，Judge 就应判定存在事实或推理问题。
+  forbidden_claims:
+    - 将内存耗尽或 eviction 压力判断为当前延迟升高的主要原因
+    - 声称没有找到可能的延迟原因
+    - 声称该超大 key 或对它的全量读取与当前延迟升高无关
+    - 引用工具返回结果中不存在的证据
+
+# 本场景只评估工具证据推理，不注入 RAG/startup 文档或用户历史，因此不声明 knowledge、memory。
