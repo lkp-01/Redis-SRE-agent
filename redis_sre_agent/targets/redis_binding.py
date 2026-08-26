@@ -12,23 +12,6 @@ from redis_sre_agent.core.instances import RedisInstance, get_instance_by_id
 
 from .contracts import BindingRequest, BindingResult, ProviderLoadRequest, TargetHandleRecord
 
-"""下面这俩测试函数倒是很有意思，可以留意一下"""
-# 测试用的找找有没有测试种子
-def _eval_target_seed(handle_record: TargetHandleRecord) -> dict[str, Any] | None:
-    seed = (handle_record.private_binding_ref or {}).get("eval_target_seed")
-    return seed if isinstance(seed, dict) else None
-
-# 如果找到了测试种子，就会用这些假数据，造一个假的RedisInstance虚拟库对象
-def _build_seeded_instance(handle_record: TargetHandleRecord) -> RedisInstance | None:
-    seed = _eval_target_seed(handle_record)
-    if not seed or seed.get("seed_kind") != "instance":
-        return None
-    payload = dict(seed)
-    payload["id"] = handle_record.target_handle
-    payload.setdefault("created_by", "agent")
-    payload.setdefault("user_id", "eval")
-    return RedisInstance.model_validate(payload)
-
 #把一个 TargetHandleRecord 变成工具可用的 Redis 实例对象。
 class RedisDataClientFactory:
 
@@ -39,7 +22,7 @@ class RedisDataClientFactory:
             return None
         instance = await get_instance_by_id(handle_record.binding_subject)
         if instance is None:
-            return _build_seeded_instance(handle_record)
+            return None
         return instance.model_copy(update={"id": handle_record.target_handle})
 
 #把“已经选中的目标”绑定成当前 ToolManager 可以加载的工具。

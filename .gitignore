@@ -68,8 +68,6 @@ coverage.xml
 .hypothesis/
 htmlcov/
 
-# Evaluation results
-*_evaluation_*.json
 test_artifacts/
 test_storage/
 
@@ -139,8 +137,6 @@ ui/test-results/
 
 # SSL certificates (generated locally)
 monitoring/nginx/certs/
-eval_reports
-
 # Root config.yaml only (subdirectory config.yaml files are preserved)
 /config.yaml
 .gitnexus

@@ -1,4 +1,0 @@
-{
-  "status": "error",
-  "error": "Timeout while scanning Redis keyspace for large keys"
-}

@@ -18,11 +18,6 @@ from typing import Any, Dict, List, Optional
 from redis_sre_agent.core.clusters import RedisCluster
 from redis_sre_agent.core.config import settings
 from redis_sre_agent.core.instances import RedisInstance, get_instance_by_id
-from redis_sre_agent.core.runtime_overrides import (
-    dispatch_tool_runtime_override,
-    get_eval_provider_families,
-    is_eval_runtime_active,
-)
 from redis_sre_agent.targets import get_target_handle_store, get_target_integration_registry
 from redis_sre_agent.targets.contracts import BindingRequest, ProviderLoadRequest
 from redis_sre_agent.tools.models import Tool, ToolActionKind, ToolCapability, ToolDefinition
@@ -31,15 +26,6 @@ from redis_sre_agent.tools.protocols import ToolProvider
 logger = logging.getLogger(__name__)
 
 _DEFAULT_LLM_TOOL_LIMIT = 64
-_EVAL_PROVIDER_PATH_BY_FAMILY = {
-    "redis_command": (
-        "redis_sre_agent.tools.diagnostics.redis_command.provider.RedisCommandToolProvider"
-    ),
-    "prometheus": (
-        "redis_sre_agent.tools.metrics.prometheus.provider.PrometheusToolProvider"
-    ),
-    "loki": "redis_sre_agent.tools.logs.loki.provider.LokiToolProvider",
-}
 ToolExecutionDecision = Any
 _REDACTED = "[REDACTED]"
 
@@ -175,14 +161,14 @@ class ToolManager:
         # 启动并进入这个异步退出栈
         await self._stack.__aenter__()
 
-        # 离线评测已有明确 Redis 目标，不能载入目标发现或其他外部入口。
-        for provider_path in ([] if is_eval_runtime_active() else self._always_on_providers):
+        # 遍历预设的“常驻工具提供者”（如目标发现工具、知识库工具）
+        for provider_path in self._always_on_providers:
             # 异步加载这些常驻 Provider，并标记 always_on=True，表示它们不依赖特定目标
             await self._load_provider(provider_path, always_on=True)
 
         # knowledge provider 不再常驻。关闭时完全不做 readiness/Redis/embedding 检查；
         # 开启后也只有 ready 才把 search 工具暴露给 LLM。
-        if not is_eval_runtime_active() and settings.rag_enabled:
+        if settings.rag_enabled:
             from redis_sre_agent.core.redis import get_rag_readiness
 
             self.rag_readiness = await get_rag_readiness(settings)
@@ -195,8 +181,7 @@ class ToolManager:
                 )
 
         # 触发 MCP (Model Context Protocol) 相关的 Provider 加载（当前为预留的插槽方法）
-        if not is_eval_runtime_active():
-            await self._load_mcp_providers()
+        await self._load_mcp_providers()
 
         # 触发支持包 (Support Package) 相关的 Provider 加载（当前为预留的插槽方法）
         await self._load_support_package_provider()
@@ -446,15 +431,7 @@ class ToolManager:
             *,
             load_key_prefix: Optional[str] = None,  # 可选的前缀，用于生成全局唯一的加载键，防止重复加载
     ) -> RedisInstance:
-        provider_paths = settings.tool_providers
-        if is_eval_runtime_active():
-            requested_families = get_eval_provider_families()
-            provider_paths = [
-                path
-                for family, path in _EVAL_PROVIDER_PATH_BY_FAMILY.items()
-                if family in requested_families
-            ]
-        for provider_path in provider_paths:
+        for provider_path in settings.tool_providers:
             # 调用底层的 _load_provider 执行实际的加载逻辑
             await self._load_provider(
                 provider_path,
@@ -559,10 +536,6 @@ class ToolManager:
 
     # 从 Thread context 恢复已绑定 target，并加载对应 provider。
     async def _load_thread_attached_targets(self) -> None:
-
-        # 评测场景的作用域必须完全由场景合同决定，不从真实线程恢复目标。
-        if is_eval_runtime_active():
-            return None
 
         # 如果当前 Manager 实例化时没有传入 thread_id，说明不在特定的对话上下文中，直接返回
         if not self.thread_id:
@@ -686,32 +659,22 @@ class ToolManager:
                 f"{available_tools[:10]}..."
             )
 
-        override_result = await dispatch_tool_runtime_override(
-            tool_name=tool_name,
-            args=normalized_args,
-            tool_by_name=self._tool_by_name,
-            routing_table=self._routing_table,
-        )
-        if override_result is not None:
-            return override_result.result
-
         try:
             args_key = json.dumps(normalized_args, sort_keys=True, separators=(",", ":"))
         except Exception:
             args_key = str(normalized_args)
         cache_key = f"{tool_name}|{args_key}"
         cacheable = tool.metadata.action_kind is ToolActionKind.READ
-        eval_active = is_eval_runtime_active()
-        if cacheable and not eval_active and cache_key in self._call_cache:
+        if cacheable and cache_key in self._call_cache:
             return self._call_cache[cache_key]
-        if cacheable and not eval_active and self._shared_cache:
+        if cacheable and self._shared_cache:
             cached_result = await self._shared_cache.get(tool_name, normalized_args)
             if cached_result is not None:
                 self._call_cache[cache_key] = cached_result
                 return cached_result
 
         result = await tool.invoke(normalized_args)
-        if cacheable and not eval_active:
+        if cacheable:
             self._call_cache[cache_key] = result
             if self._shared_cache:
                 await self._shared_cache.set(tool_name, normalized_args, result)

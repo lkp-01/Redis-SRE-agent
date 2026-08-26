@@ -204,8 +204,5 @@ python -m pytest -o addopts="" -q -m integration tests/integration/test_rag_redi
 
 本阶段不恢复独立 Knowledge Agent、LLM ingest 工具、Hybrid/RRF/reranker、skills、
 support tickets、knowledge pack、网页/PDF ingestion、MCP pool/write approval/server、
-API、worker、scheduler、完整 eval 平台、OpenTelemetry 或 UI。当前保留 BigKey replay、
-结构化硬断言和 LLM judge；尚未恢复 live suite 和报告落盘链路。场景使用 `judge: semantic`
-时，`redis-sre-agent eval run evals/scenarios/outcome/BigKey/scenario.yaml --json` 会调用配置的
-mini 模型完成语义评分。测试必须注入 fake judge，不访问真实 OpenAI。Click `LazyGroup`、Chat/Triage
-StateGraph、Thread 持久化、target binding 和 Redis 只读诊断行为保持既有边界。
+API、worker、scheduler、OpenTelemetry 或 UI。Click `LazyGroup`、Chat/Triage StateGraph、
+Thread 持久化、target binding 和 Redis 只读诊断行为保持既有边界。

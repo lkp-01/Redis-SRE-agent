@@ -1,9 +1,0 @@
-{
-  "status": "success",
-  "client_type": "replica",
-  "count": 2,
-  "clients": [
-    {"id": "2201", "addr": "10.50.0.21:6379", "name": "replica-fast", "flags": "S", "events": "r", "idle": "0", "cmd": "replconf", "obl": "0", "oll": "0", "omem": "0"},
-    {"id": "2202", "addr": "10.50.0.22:6379", "name": "replica-slow", "flags": "S", "events": "w", "idle": "0", "cmd": "psync", "obl": "65536", "oll": "26240", "omem": "1719664640"}
-  ]
-}
