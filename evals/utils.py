@@ -1,12 +1,21 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from langchain_core.messages import AIMessage, ToolMessage, AnyMessage, HumanMessage
-from collections.abc import Mapping, Sequence, Callable
-from langsmith import testing as t  #langsmith的平台
-from typing import Any, TYPE_CHECKING
-from redis_sre_agent.agent.models import AgentResponse
-
+from collections.abc import AsyncIterator, Mapping, Sequence, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+import ipaddress
 import logging
+import os
+from typing import Any, TYPE_CHECKING
+from urllib.parse import urlparse
+import uuid
+
+from langchain_core.messages import AIMessage, ToolMessage, AnyMessage, HumanMessage
+from langsmith import testing as t  #langsmith的平台
+from pydantic import SecretStr
+from redis.asyncio import Redis
+from redis_sre_agent.agent.models import AgentResponse
+from redis_sre_agent.core.instances import RedisInstance
+
 from langsmith.run_helpers import get_current_run_tree
 
 logger = logging.getLogger(__name__)
@@ -14,9 +23,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
-    from langgraph.graph.state import CompiledStateGraph
-
-import uuid
 import pytest
 
 @dataclass(frozen=True)
@@ -468,7 +474,10 @@ def _build_logged_inputs(
 
 def _log_run_inputs(logged_inputs: dict[str, Any]) -> None:
     """用刚刚打包的数据，替换langsmith自己要抓取的数据"""
-    t.log_inputs(logged_inputs)
+    try:
+        t.log_inputs(logged_inputs)
+    except ValueError:
+        logger.debug("LangSmith test context is unavailable; eval inputs will not be recorded")
     run_tree = get_current_run_tree()
     if run_tree is not None:
         run_tree.inputs = logged_inputs
@@ -588,9 +597,252 @@ def _assert_expectations(
 #===========================================================================
 @dataclass
 class EvalEnvironment:
+    """一个 eval case 声明的、可被物化的 Redis 世界。"""
+
     redis_data: dict[str, Any]
     metrics: dict[str, Any] | None = None
     logs: list[dict[str, Any]] | None = None
+    redis_config: dict[str, str | int | float] = field(default_factory=dict)
+    redis_setup_commands: list[tuple[str, list[Any]]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EvalRuntime:
+    """`EvalEnvironment` 物化后实际提供给 Agent 的运行时资源。"""
+
+    redis_instance: RedisInstance
+    redis_url: str
+    # Phase 2: materialize metrics/logs into isolated Prometheus/Loki test runtime.
+    prometheus_url: str | None = None
+    loki_url: str | None = None
+
+
+_EVAL_REDIS_URL_ENV = "EVAL_REDIS_URL"
+_SUPPORTED_REDIS_CONFIG_KEYS = frozenset(
+    {
+        "maxmemory",
+        "maxmemory-policy",
+        "timeout",
+        "slowlog-log-slower-than",
+        "slowlog-max-len",
+    }
+)
+_ALLOWED_SETUP_COMMANDS = frozenset(
+    {
+        "SET",
+        "MSET",
+        "HSET",
+        "LPUSH",
+        "RPUSH",
+        "SADD",
+        "ZADD",
+        "XADD",
+        "GEOADD",
+        "PFADD",
+        "SETBIT",
+    }
+)
+
+
+def _is_loopback_redis_host(hostname: str | None) -> bool:
+    """只将 loopback 主机视为默认可安全清空的 eval Redis。"""
+
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _resolve_eval_redis_url(redis_url: str | None = None) -> str:
+    """读取并验证专用 eval Redis URL，拒绝任何非 loopback 目标。"""
+
+    candidate = (redis_url or os.getenv(_EVAL_REDIS_URL_ENV) or "").strip()
+    if not candidate:
+        raise RuntimeError(
+            "Eval Redis is not configured. Set EVAL_REDIS_URL to a dedicated "
+            "loopback Redis database before running Redis evals."
+        )
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"redis", "rediss"} or not _is_loopback_redis_host(parsed.hostname):
+        raise ValueError(
+            "EVAL_REDIS_URL must target a dedicated loopback Redis instance; "
+            "non-loopback and unix-socket URLs are refused because eval teardown uses FLUSHDB."
+        )
+    return candidate
+
+
+def _coerce_redis_scalar(value: Any, *, label: str) -> str | int | float | bytes:
+    """限制声明式 seed 数据为 redis-py 可安全表达的标量。"""
+
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, bytes)):
+        raise TypeError(
+            f"{label} must be a str, int, float, or bytes; got {type(value).__name__}"
+        )
+    return value
+
+
+async def _seed_redis_data(client: Redis, redis_data: Mapping[str, Any]) -> None:
+    """将简单的 Python 数据结构写入本 case 的专用 Redis 数据库。"""
+
+    for raw_key, value in redis_data.items():
+        if not isinstance(raw_key, str) or not raw_key:
+            raise ValueError("redis_data keys must be non-empty strings")
+
+        if isinstance(value, Mapping):
+            if not value:
+                raise ValueError(f"redis_data[{raw_key!r}] cannot be an empty hash")
+            mapping = {
+                field_name: _coerce_redis_scalar(
+                    field_value,
+                    label=f"redis_data[{raw_key!r}][{field_name!r}]",
+                )
+                for field_name, field_value in value.items()
+            }
+            if not all(isinstance(field_name, str) and field_name for field_name in mapping):
+                raise ValueError(f"redis_data[{raw_key!r}] hash fields must be non-empty strings")
+            await client.hset(raw_key, mapping=mapping)
+        elif isinstance(value, list):
+            if not value:
+                raise ValueError(f"redis_data[{raw_key!r}] cannot be an empty list")
+            await client.rpush(
+                raw_key,
+                *(
+                    _coerce_redis_scalar(item, label=f"redis_data[{raw_key!r}] list item")
+                    for item in value
+                ),
+            )
+        else:
+            await client.set(raw_key, _coerce_redis_scalar(value, label=f"redis_data[{raw_key!r}]"))
+
+
+async def _apply_redis_setup_commands(
+    client: Redis,
+    commands: Sequence[tuple[str, list[Any]]],
+) -> None:
+    """运行少量无法由 ``redis_data`` 表达的、白名单内的写入初始化命令。"""
+
+    for raw_command, raw_args in commands:
+        command = str(raw_command).upper()
+        if command not in _ALLOWED_SETUP_COMMANDS:
+            raise ValueError(
+                f"redis_setup_commands does not allow {command!r}; "
+                f"allowed commands: {sorted(_ALLOWED_SETUP_COMMANDS)}"
+            )
+        if not isinstance(raw_args, list):
+            raise TypeError(f"redis_setup_commands arguments for {command!r} must be a list")
+        await client.execute_command(command, *raw_args)
+
+
+async def _capture_redis_config(
+    client: Redis,
+    redis_config: Mapping[str, str | int | float],
+) -> dict[str, str]:
+    """读取每个将被覆盖的 Redis 配置，以便 finally 中无条件恢复。"""
+
+    original: dict[str, str] = {}
+    for raw_key, value in redis_config.items():
+        if raw_key not in _SUPPORTED_REDIS_CONFIG_KEYS:
+            raise ValueError(
+                f"redis_config key {raw_key!r} is unsupported; "
+                f"supported keys: {sorted(_SUPPORTED_REDIS_CONFIG_KEYS)}"
+            )
+        _coerce_redis_scalar(value, label=f"redis_config[{raw_key!r}]")
+        current = await client.config_get(raw_key)
+        saved_value = current.get(raw_key)
+        if saved_value is None:
+            raise RuntimeError(f"Eval Redis did not return current value for CONFIG GET {raw_key}")
+        original[raw_key] = str(saved_value)
+    return original
+
+
+async def _restore_redis_config(client: Redis, original_config: Mapping[str, str]) -> None:
+    """尽最大努力恢复本 case 覆盖过的配置。"""
+
+    for key, value in original_config.items():
+        await client.config_set(key, value)
+
+
+@asynccontextmanager
+async def materialize_environment(
+    environment: EvalEnvironment,
+    *,
+    redis_url: str | None = None,
+) -> AsyncIterator[EvalRuntime]:
+    """将一个声明式 eval 环境物化到专用的 loopback Redis，并在退出时完整清理。
+
+    该实现用 ``FLUSHDB`` 隔离 case；共享同一 ``EVAL_REDIS_URL`` 的 eval 必须串行执行。
+    """
+
+    resolved_url = _resolve_eval_redis_url(redis_url)
+    client = Redis.from_url(resolved_url, decode_responses=True)
+    original_config: dict[str, str] = {}
+
+    try:
+        try:
+            await client.ping()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Eval Redis is unavailable. Verify that EVAL_REDIS_URL points to a reachable "
+                "dedicated loopback Redis instance."
+            ) from exc
+
+        await client.flushdb()
+        original_config = await _capture_redis_config(client, environment.redis_config)
+        for key, value in environment.redis_config.items():
+            await client.config_set(key, str(value))
+        await _seed_redis_data(client, environment.redis_data)
+        await _apply_redis_setup_commands(client, environment.redis_setup_commands)
+
+        runtime = EvalRuntime(
+            redis_instance=RedisInstance(
+                id=f"eval-redis-{uuid.uuid4().hex}",
+                name="Redis SRE eval environment",
+                connection_url=SecretStr(resolved_url),
+                environment="test",
+                usage="eval",
+                description="Isolated Redis SRE eval environment",
+                created_by="agent",
+            ),
+            redis_url=resolved_url,
+        )
+        yield runtime
+    finally:
+        try:
+            await client.flushdb()
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to clean up the eval Redis database")
+        try:
+            await _restore_redis_config(client, original_config)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to restore eval Redis configuration")
+        await client.aclose()
+
+
+@asynccontextmanager
+async def _inject_eval_runtime(agent: Any, runtime: EvalRuntime) -> AsyncIterator[None]:
+    """临时把真实 Agent 路由到 eval Redis，并精确恢复原始属性。"""
+
+    missing = object()
+    original_instance = getattr(agent, "redis_instance", missing)
+    original_cluster = getattr(agent, "redis_cluster", missing)
+    setattr(agent, "redis_instance", runtime.redis_instance)
+    setattr(agent, "redis_cluster", None)
+    try:
+        yield
+    finally:
+        if original_instance is missing:
+            delattr(agent, "redis_instance")
+        else:
+            setattr(agent, "redis_instance", original_instance)
+        if original_cluster is missing:
+            delattr(agent, "redis_cluster")
+        else:
+            setattr(agent, "redis_cluster", original_cluster)
 
 #===========================================================================
 
@@ -612,17 +864,22 @@ async def run_agent_async(
     logged_inputs = _build_logged_inputs(model, eval_metadata)
     _log_run_inputs(logged_inputs)
 
-    result = await agent.process_query(
-        query,
-        session_id=session_id,
-        user_id=user_id,
-        max_iterations=max_iterations,
-        context=context,
-        conversation_history=conversation_history,
-        capture_trace=True,
-    )
+    async with materialize_environment(environment) as runtime:
+        async with _inject_eval_runtime(agent, runtime):
+            result = await agent.process_query(
+                query,
+                session_id=session_id,
+                user_id=user_id,
+                max_iterations=max_iterations,
+                context=context,
+                conversation_history=conversation_history,
+                capture_trace=True,
+            )
 
-    t.log_outputs(result.model_dump())
+    try:
+        t.log_outputs(result.model_dump())
+    except ValueError:
+        logger.debug("LangSmith test context is unavailable; eval outputs will not be recorded")
 
     trajectory = _trajectory_from_result(result)
 

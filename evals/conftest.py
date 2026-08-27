@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
 # ============================================================
 # 1. 注册 pytest 插件
 # ============================================================
-# pytest_reporter.py 负责收集和输出 eval 的评测结果。
-pytest_plugins = ["evals.pytest_reporter"]
+# py_reporter.py 负责收集和输出 eval 的评测结果。
+pytest_plugins = ["evals.py_reporter"]
 
 
 # ============================================================
@@ -308,5 +310,17 @@ def model_name(request: pytest.FixtureRequest) -> str | None:
         return None
 
     return str(model)
+
+
+@pytest.fixture
+def eval_redis_url() -> str:
+    """返回显式配置的专用 Redis eval URL；未配置时跳过真实 Redis 链路测试。"""
+
+    redis_url = os.getenv("EVAL_REDIS_URL")
+    if not redis_url:
+        pytest.skip(
+            "set EVAL_REDIS_URL to a dedicated loopback Redis instance to run real Redis evals"
+        )
+    return redis_url
 
 
