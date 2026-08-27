@@ -152,6 +152,51 @@ class LLMJudge(SuccessAssertion):
 
         return results
 
+#-----------------------------------------
+# 实现父类函数
+#-----------------------------------------
+    def check(self, trajectory: AgentTrajectory) -> bool:
+        """调用 LLM Judge，所有 criteria 都通过时返回 True。"""
+        results = self._grade(trajectory)
+
+        # 缓存本次 Judge 结果，避免 describe_failure() 再调用一次 LLM
+        self._last_results = results
+
+        return all(result["score"] for result in results)
+
+
+    def describe_failure(self, trajectory: AgentTrajectory) -> str:
+        """返回所有失败 criterion 的具体原因。"""
+
+        # 正常情况下 check() 已经跑过，直接复用结果
+        results = (
+            self._last_results
+            if self._last_results is not None
+            else self._grade(trajectory)
+        )
+
+        failed = [
+            (index, result)
+            for index, result in enumerate(results, start=1)
+            if not result["score"]
+        ]
+
+        parts = [
+            f"Criterion {index} failed: "
+            f"{result.get('comment') or 'LLM Judge 未提供失败原因'}"
+            for index, result in failed
+        ]
+
+        return (
+            f"{len(failed)}/{len(results)} criteria failed — "
+            + "; ".join(parts)
+        )
+
+
+
+
+
+
 def llm_judge(
     *criteria: str,
     judge_model: str = _DEFAULT_JUDGE_MODEL,
