@@ -22,6 +22,12 @@ from redis_sre_agent.core.instances import RedisInstance
 from redis_sre_agent.core.targets import TargetBinding, get_target_bindings_from_context
 from redis_sre_agent.tools.manager import ToolManager
 
+from .models import (
+    AgentResponse,
+    TargetSelectionDecision,
+    with_execution_trace,
+)
+
 from .helpers import (
     NullEmitter,
     build_adapters_for_tooldefs,
@@ -681,6 +687,7 @@ User Query: {query}"""
         context: Optional[Dict[str, Any]] = None,
         progress_emitter: Optional[Any] = None,
         conversation_history: Optional[List[Any]] = None,
+        capture_trace: bool = False,   # 新增
     ) -> AgentResponse:
         """通过 ChatAgent workflow 处理一次查询。"""
 
@@ -725,11 +732,19 @@ User Query: {query}"""
                     "Chat target preflight failed (error=%s).",
                     type(exc).__name__,
                 )
-                return AgentResponse(
-                    response="实时诊断所需的 Redis 目标解析失败，请检查目标目录配置后重试。"
-                )
+
+                return with_execution_trace(
+                    AgentResponse(
+                        response="实时诊断所需的 Redis 目标解析失败，请检查目标目录配置后重试。"
+                    ),
+                    capture_trace=capture_trace,
+                    error=f"{type(exc).__name__}: {exc}",
+                )            
             if early_response is not None:
-                return early_response
+                return with_execution_trace(
+                    early_response,
+                    capture_trace=capture_trace,
+                )
 
             workflow = self._build_workflow(
                 tool_mgr,
@@ -776,9 +791,26 @@ User Query: {query}"""
                 )
                 tool_envelopes = list(final_state.get("signals_envelopes") or [])
                 messages = list(final_state.get("messages") or [])
+
+                iteration_count_obj = final_state.get("iteration_count", 0)
+
+                iteration_count = (
+                    iteration_count_obj
+                    if isinstance(iteration_count_obj, int)
+                    else 0
+                )
+
                 response_text = extract_last_ai_response(messages, terminal_only=True)
                 if response_text:
-                    return AgentResponse(response=response_text, tool_envelopes=tool_envelopes)
+                    return with_execution_trace(
+                        AgentResponse(
+                            response=response_text,
+                            tool_envelopes=tool_envelopes,
+                        ),
+                        capture_trace=capture_trace,
+                        messages=messages,
+                        iteration_count=iteration_count,
+                    )
                 if self._reached_iteration_limit(final_state, max_iterations):
                     iteration_count = final_state.get("iteration_count", max_iterations)
                     state_max_iterations = final_state.get("max_iterations", max_iterations)
@@ -797,7 +829,15 @@ User Query: {query}"""
                     )
                 else:
                     response_text = "I couldn't process that query. Please try rephrasing."
-                return AgentResponse(response=response_text, tool_envelopes=tool_envelopes)
+                return with_execution_trace(
+                    AgentResponse(
+                        response=response_text,
+                        tool_envelopes=tool_envelopes,
+                    ),
+                    capture_trace=capture_trace,
+                    messages=messages,
+                    iteration_count=iteration_count,
+                )
             except Exception as exc:
                 logger.exception("Chat agent error: %s", exc)
                 return AgentResponse(response=f"Error processing query: {exc}")

@@ -5,9 +5,8 @@
 """
 
 from __future__ import annotations
-
+from langchain_core.messages import AnyMessage, BaseMessage
 from typing import Any, Dict, List, Literal, Optional
-
 from pydantic import BaseModel, Field
 
 # AI在后台使用工具就要按照这个类进行记录(就像填表一样)
@@ -91,6 +90,12 @@ class TargetSelectionDecision(BaseModel):
     )
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
+# 给 eval / observability 使用
+class AgentExecutionTrace(BaseModel):
+    messages: List[AnyMessage] = Field(default_factory=list)
+    iteration_count: int = 0
+    error: str | None = None
+
 # AI思考完最终打包出来的东西，包括回复、缩到的结果、工具调用的证据
 class AgentResponse(BaseModel):
     """Agent 返回值，沿用原项目响应形状。"""
@@ -99,11 +104,49 @@ class AgentResponse(BaseModel):
     search_results: List[Dict[str, Any]] = Field(default_factory=list)
     tool_envelopes: List[Dict[str, Any]] = Field(default_factory=list)
 
+    # 默认没有 trace。
+    # exclude=True：即使 capture_trace=True，
+    # model_dump() 也不会把完整消息轨迹序列化出去。
+    trace: Optional[AgentExecutionTrace] = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
     def model_post_init(self, __context: Any) -> None:
         """citation 的唯一权威来源是顶层真实 tool_envelopes。"""
         from redis_sre_agent.agent.helpers import extract_citations
 
         object.__setattr__(self, "search_results", extract_citations(self.tool_envelopes))
+
+# 即使response.trace is not None，由于exclude=True，response里依然没有trace
+def with_execution_trace(
+    response: AgentResponse,
+    *,
+    capture_trace: bool,
+    messages: Optional[List[BaseMessage]] = None,
+    iteration_count: int = 0,
+    error: Optional[str] = None,
+) -> AgentResponse:
+    """仅在显式要求时给 AgentResponse 附加运行轨迹。"""
+
+    if not capture_trace:
+        return response
+
+    safe_iteration_count = (
+        iteration_count
+        if isinstance(iteration_count, int) and iteration_count >= 0
+        else 0
+    )
+
+    return response.model_copy(
+        update={
+            "trace": AgentExecutionTrace(
+                messages=list(messages or []),
+                iteration_count=safe_iteration_count,
+                error=error,
+            )
+        }
+    )
 
 # 用来记录AI是怎么思考的记录留存
 class DecisionTrace(BaseModel):

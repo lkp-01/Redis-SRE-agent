@@ -36,6 +36,10 @@ from .helpers import (
     resolve_graph_thread_id,
 )
 from .models import AgentResponse, TopicsList
+from .models import (
+    TargetSelectionDecision,
+    with_execution_trace,
+)
 from .prompts import SRE_SYSTEM_PROMPT
 from .terminal_synthesis import (
     TerminalSynthesisConfig,
@@ -839,6 +843,7 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
             context: Optional[Dict[str, Any]] = None,  # 包含集群/实例信息的上下文
             conversation_history: Optional[List[BaseMessage]] = None,  # 历史聊天记录
             progress_emitter: Optional[Any] = None,  # 进度发射器，用于向前端推送执行状态
+            capture_trace: bool = False,
     ) -> AgentResponse:  # 返回结构化的诊断响应
 
         # 1. 准备和规范化上下文数据
@@ -935,6 +940,17 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
             tool_envelopes = list(final_state.get("signals_envelopes") or [])
             messages = list(final_state.get("messages") or [])
 
+            iteration_count_obj = final_state.get(
+                "iteration_count",
+                0,
+            )
+
+            iteration_count = (
+                iteration_count_obj
+                if isinstance(iteration_count_obj, int)
+                else 0
+            )
+
             # 尝试从消息记录的末尾提取大模型的最后一次发言（只提取纯文本回答）
             response_text = extract_last_ai_response(messages, terminal_only=True)
 
@@ -944,7 +960,15 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
                 )
 
                 # 返回标准的格式化响应：包含文本回答和具体的工具执行记录
-            return AgentResponse(response=response_text, tool_envelopes=tool_envelopes)
+            return with_execution_trace(
+                AgentResponse(
+                    response=response_text,
+                    tool_envelopes=tool_envelopes,
+                ),
+                capture_trace=capture_trace,
+                messages=messages,
+                iteration_count=iteration_count,
+            )
 
     # 对外接口
     async def process_query(
@@ -956,6 +980,7 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
             context: Optional[Dict[str, Any]] = None,  # 上下文环境变量
             conversation_history: Optional[List[BaseMessage]] = None,  # 聊天历史
             progress_emitter: Optional[Any] = None,  # 进度发射器
+            capture_trace: bool = False,
     ) -> AgentResponse:
         """处理一次 SRE 查询。"""
 
@@ -972,6 +997,7 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
                 context=context,
                 conversation_history=conversation_history,
                 progress_emitter=progress_emitter,
+                capture_trace=capture_trace,
             )
 
         except Exception as exc:
@@ -980,7 +1006,13 @@ IMPORTANT CONTEXT: This query is scoped to Redis cluster:
             logger.exception("SRE agent error: %s", exc)
 
             # 返回一个降级的 AgentResponse 对象，告知调用方发生了错误，保证系统不会直接崩溃退出
-            return AgentResponse(response=f"Error processing query: {exc}")
+            return with_execution_trace(
+                AgentResponse(
+                    response=f"Error processing query: {exc}"
+                ),
+                capture_trace=capture_trace,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     # 对外公开对口的诊断主入口：对底层逻辑进行了一层通用的异常拦截保护
     async def resume_query(
