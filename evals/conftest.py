@@ -323,4 +323,26 @@ def eval_redis_url() -> str:
         )
     return redis_url
 
+# ============================================================
+# 7. model fixture：创建本次 eval 真正使用的 LLM
+# ============================================================
+
+@pytest.fixture
+def model(model_name):
+    """创建 eval 使用的真实 LLM 对象。"""
+    from redis_sre_agent.core.llm_helpers import create_llm
+
+    return create_llm(model=model_name)
+
+
+# ============================================================
+# 8. agent fixture：创建本次 eval 使用的 Agent
+# ============================================================
+
+@pytest.fixture
+def agent(model, eval_redis_url):
+    """为每个 eval case 创建一个独立的 ChatAgent。"""
+    from redis_sre_agent.agent.chat_agent import ChatAgent
+
+    return ChatAgent(llm=model)
 

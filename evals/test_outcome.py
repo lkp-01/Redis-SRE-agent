@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pytest
+from evals.llm_judge import llm_judge
 
 from evals.utils import (
     TrajectoryScorer,
@@ -12,6 +13,7 @@ from evals.utils import (
 )
 
 pytestmark = [
+    pytest.mark.langsmith,
     pytest.mark.eval_category("outcome"),
 ]
 
@@ -20,10 +22,11 @@ pytestmark = [
 # A：Baseline outcome evals
 # ============================================================
 
+@pytest.mark.langsmith
 @pytest.mark.asyncio
 @pytest.mark.eval_tier("tier_1")
 @pytest.mark.eval_category("outcome")
-async def test_detect_bigkey(agent):
+async def test_detect_bigkey(agent, model):
     environment = EvalEnvironment(
         redis_data={
             # 普通 Key：作为背景噪声

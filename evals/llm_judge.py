@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from langsmith import testing as t
 import warnings
+from dataclasses import dataclass, field
 
 _TRAJECTORY_PROMPT = """
 你是一个严格的评分助手。
@@ -41,6 +42,7 @@ _RESPONSES_PROMPT = """
 _DEFAULT_JUDGE_MODEL = "deepseek-v4-pro"
 _MAX_JUDGE_WORKERS = 8
 
+@dataclass
 class LLMJudge(SuccessAssertion):
 
 #-----------------------------------------
@@ -61,7 +63,7 @@ class LLMJudge(SuccessAssertion):
     judge_model: str = _DEFAULT_JUDGE_MODEL
     """裁判大语言模型的模型标识符。"""
 
-    criteria: tuple[str, ...]
+    criteria: tuple[str, ...]= field(default_factory=tuple)
     """智能体输出必须满足的人类可读的评估标准。"""
 
 #·········································································································
